@@ -133,6 +133,7 @@ type MessageBody struct {
 
 type MessageDescription struct {
 	PropertyOperation xsd.AnyType `xml:"PropertyOperation,attr"`
+	UtcTime           xsd.AnyType `xml:"UtcTime,attr"`
 	Source            Source      `json:",omitempty" xml:",omitempty"`
 	Data              Data        `json:",omitempty" xml:",omitempty"`
 }

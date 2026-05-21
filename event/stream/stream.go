@@ -10,6 +10,14 @@ import (
 	"github.com/kerberos-io/onvif"
 )
 
+// closeDrainTimeout bounds Close's wait for the pull and renew
+// goroutines to exit. The loops block in caller.SendSoap which is not
+// ctx-aware (the underlying http.Client is the only thing that can
+// unblock them — see caller below). On a hung HTTP transport Close
+// would otherwise wait forever; instead it returns an error and lets
+// the calling agent move on.
+const closeDrainTimeout = 5 * time.Second
+
 // closeUnsubscribeTimeout bounds the Unsubscribe SOAP call issued by
 // Close. A subscription expires at the camera once InitialTermination
 // elapses without a renew, so a missed unsubscribe is at worst
@@ -103,8 +111,17 @@ func (o Options) withDefaults() Options {
 }
 
 // caller is the *onvif.Device subset Stream depends on. Implementations
-// must be safe for concurrent use — pull and renew goroutines call in
-// from separate goroutines. *onvif.Device satisfies this via http.Client.
+// must:
+//
+//   - Be safe for concurrent use — pull and renew goroutines call in
+//     from separate goroutines. *onvif.Device satisfies this via
+//     http.Client.
+//   - Enforce a per-request timeout via the underlying HTTP client.
+//     The methods do not take a ctx, so ctx-cancel cannot interrupt a
+//     hung request; only the HTTP client's own timeout can. Close
+//     bounds its drain wait at closeDrainTimeout to survive a misbehaving
+//     caller, but a leaking goroutine remains until the HTTP call
+//     eventually returns.
 type caller interface {
 	CallMethod(method any) (*http.Response, error)
 	SendSoap(endpoint, body string) (*http.Response, error)
@@ -194,15 +211,24 @@ func (s *Stream) Events() <-chan Event { return s.events }
 // when the Stream stops.
 func (s *Stream) Errors() <-chan error { return s.errors }
 
-// Close stops the background goroutines, waits for them to exit and
-// Unsubscribes from the camera. Subsequent calls are no-ops.
+// Close stops the background goroutines, waits up to closeDrainTimeout
+// for them to exit, and then Unsubscribes from the camera (also bounded,
+// by closeUnsubscribeTimeout). Subsequent calls are no-ops.
 //
-// Unsubscribe is bounded by closeUnsubscribeTimeout so a hung camera
-// connection cannot wedge the caller.
+// If the drain times out the goroutines are likely wedged inside a
+// non-ctx-aware caller.SendSoap; they will exit on their own once the
+// HTTP call returns. Unsubscribe is skipped in that case — the
+// subscription expires at the camera anyway.
 func (s *Stream) Close() error {
 	s.closeOnce.Do(func() {
 		s.cancel()
-		<-s.done
+
+		select {
+		case <-s.done:
+		case <-time.After(closeDrainTimeout):
+			s.closeErr = fmt.Errorf("close: pull/renew loops did not drain within %s (likely stuck in caller HTTP)", closeDrainTimeout)
+			return
+		}
 
 		errCh := make(chan error, 1)
 		go func() {

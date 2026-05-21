@@ -22,8 +22,9 @@ import (
 // require tests to enumerate every call.
 //
 // blockUnsubscribe, when non-nil, causes SendSoap calls whose body
-// contains "Unsubscribe" to block until the channel is closed. Used to
-// verify Close's timeout path.
+// contains "Unsubscribe" to block until the channel is closed.
+// blockAllSendSoap, when non-nil, blocks every SendSoap call until
+// closed (simulates a hung HTTP transport).
 type fakeCaller struct {
 	mu               sync.Mutex
 	callMethodResps  []fakeResp
@@ -33,6 +34,7 @@ type fakeCaller struct {
 	callMethodCalls  []any
 	sendSoapCalls    [][2]string
 	blockUnsubscribe chan struct{}
+	blockAllSendSoap chan struct{}
 }
 
 type fakeResp struct {
@@ -84,8 +86,12 @@ func (f *fakeCaller) SendSoap(endpoint, body string) (*http.Response, error) {
 		f.sendSoapResps = f.sendSoapResps[1:]
 	}
 	block := f.blockUnsubscribe
+	blockAll := f.blockAllSendSoap
 	f.mu.Unlock()
 
+	if blockAll != nil {
+		<-blockAll
+	}
 	if block != nil && strings.Contains(body, "Unsubscribe") {
 		<-block
 	}
@@ -443,4 +449,49 @@ func TestFakeCaller_QueueThenDefaultFallback(t *testing.T) {
 	n, _ = r3.Body.Read(b3)
 	assert.Contains(t, string(b3[:n]), "PullMessagesResponse",
 		"default SendSoap should be an empty PullMessagesResponse envelope")
+}
+
+func TestClose_BoundedWhenLoopsStuckOnHungHTTP(t *testing.T) {
+	// Simulates a hung HTTP transport: every SendSoap blocks
+	// indefinitely. The pull and renew loops are wedged inside
+	// SendSoap and ctx-cancel cannot unblock them. Close must still
+	// return within its bounded budget so the agent's shutdown does
+	// not hang.
+	fc := newFakeCaller()
+	fc.queueCallMethod(createPullPointResp, nil)
+	blockAll := make(chan struct{})
+	defer close(blockAll)
+	fc.mu.Lock()
+	fc.blockAllSendSoap = blockAll
+	fc.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s, err := newStream(ctx, fc, Options{
+		PullTimeout:        100 * time.Millisecond,
+		InitialTermination: 30 * time.Second,
+	})
+	require.NoError(t, err)
+
+	// Wait until pullLoop is actually parked inside the blocked
+	// SendSoap. Without this, Close races with the loop's first
+	// iteration and exits via the ctx pre-check instead of
+	// exercising the drain-timeout path.
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && fc.sendSoapCallCount() == 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	require.GreaterOrEqual(t, fc.sendSoapCallCount(), 1, "pullLoop never reached SendSoap")
+
+	start := time.Now()
+	err = s.Close()
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "drain", "expected a drain-timeout error")
+	// Total budget is closeDrainTimeout for the wait + ~0 for unsubscribe
+	// (which is skipped when drain times out). Give plenty of slack for
+	// scheduling on a loaded CI machine.
+	assert.Less(t, elapsed, closeDrainTimeout+2*time.Second,
+		"Close exceeded bound (%s); expected ~%s", elapsed, closeDrainTimeout)
 }

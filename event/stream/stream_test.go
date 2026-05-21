@@ -326,7 +326,7 @@ func TestStream_PullErrorSurfacedOnErrorsChannel(t *testing.T) {
 func TestStream_OptionsApplyDefaults(t *testing.T) {
 	o := defaultOptions()
 	assert.Equal(t, 5*time.Second, o.PullTimeout)
-	assert.Equal(t, 10, o.MessageLimit)
+	assert.Equal(t, 32, o.MessageLimit)
 	assert.Equal(t, 60*time.Second, o.InitialTermination)
 	assert.Equal(t, 16, o.BufferSize)
 }

@@ -73,7 +73,7 @@ func main() {
 
 	s, err := stream.NewStream(ctx, dev, stream.Options{
 		DeviceID:    *deviceID,
-		TopicFilter: *filter,
+		RawTopicFilter: *filter,
 		PullTimeout: *pullTimeout,
 	})
 	if err != nil {

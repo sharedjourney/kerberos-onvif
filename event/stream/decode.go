@@ -7,8 +7,11 @@ import (
 	"github.com/kerberos-io/onvif/event"
 )
 
-// Decode converts a single ONVIF NotificationMessage into the package's
-// normalized Event representation.
+// decode converts a single ONVIF NotificationMessage into the package's
+// normalized Event representation. Unexported because the only intended
+// caller is the Stream; downstream consumers receive decoded Events on
+// the Events channel. Tests reach decode directly because they're in
+// the same package.
 //
 // deviceID is supplied by the caller because the message itself does not
 // identify the originating camera. observedAt is recorded verbatim as
@@ -18,7 +21,7 @@ import (
 // When the Topic does not match any classifier rule the returned Event
 // has Kind == KindUnknown but Source, Data and Topic are still populated
 // so consumers can fall back to inspecting the wire form.
-func Decode(msg event.NotificationMessage, deviceID string, observedAt time.Time) Event {
+func decode(msg event.NotificationMessage, deviceID string, observedAt time.Time) Event {
 	topic := string(msg.Topic.TopicKinds)
 	desc := msg.Message.Message
 	return Event{

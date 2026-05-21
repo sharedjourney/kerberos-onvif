@@ -31,55 +31,71 @@ const maxResponseBytes = 10 << 20
 // elapses, so a missed unsubscribe is at worst cosmetic.
 const closeUnsubscribeTimeout = 5 * time.Second
 
-// Options configures a Stream. The zero value is usable; defaultOptions
-// fills in production-sensible defaults for any unset field.
+// Options configures a Stream.
+//
+// Zero-value policy: every duration / int field treats zero as "use the
+// default". To opt out of reconnect entirely set DisableReconnect=true
+// (sentinel `ReconnectAfterFailures=0` would otherwise collide with the
+// default-injection policy). To get a synchronous (unbuffered) channel
+// pair set BufferSize=-1.
 type Options struct {
-	// DeviceID identifies the camera in emitted Events. Recommended so a
-	// single channel can fan in multiple cameras. Empty is allowed.
+	// DeviceID identifies the camera in emitted Events. Recommended so
+	// a single channel can fan in multiple cameras. Empty is allowed.
 	DeviceID string
-	// TopicFilter is the raw ONVIF ConcreteSet TopicExpression filter
-	// passed to CreatePullPointSubscription. The empty string means no
+	// RawTopicFilter is the raw ONVIF ConcreteSet TopicExpression
+	// filter passed to CreatePullPointSubscription. Empty means no
 	// filter — required for AXIS, accepted by every other vendor we
-	// support. Callers should normally leave this empty and rely on
-	// Classify for routing.
-	TopicFilter string
-	// PullTimeout is the server-side wait time in each PullMessages call
-	// (xsd:duration). The camera returns early when messages are
-	// available; otherwise it returns empty after this timeout. Default:
-	// 5s.
+	// support. The name carries 'Raw' because the value is fed verbatim
+	// into the SOAP envelope: callers should normally leave it empty
+	// and rely on Classify for routing rather than ask the camera to
+	// filter server-side, which is fragile across vendors.
+	RawTopicFilter string
+	// PullTimeout is the server-side wait time in each PullMessages
+	// call (xsd:duration). The camera returns early when messages are
+	// available; otherwise it returns empty after this timeout. Zero
+	// means default (5s).
 	PullTimeout time.Duration
 	// MessageLimit caps the number of NotificationMessage entries
-	// returned per PullMessages call. Default: 10.
+	// returned per PullMessages call. Zero means default (32). A busy
+	// AXIS with many configured inputs can burst beyond 10 per pull;
+	// 32 covers that without significantly enlarging quiet pulls.
 	MessageLimit int
 	// InitialTermination is the requested subscription lifetime passed
 	// to CreatePullPointSubscription. The renew loop refreshes well
-	// before this expires. Default: 60s.
+	// before this expires. Zero means default (60s).
 	InitialTermination time.Duration
 	// RenewMargin is how long before InitialTermination expiry the
 	// renew loop fires. Larger margins tolerate slower networks at the
-	// cost of more renew SOAP calls. Default: 10s.
+	// cost of more renew SOAP calls. Zero means default (10s).
 	RenewMargin time.Duration
 	// ReconnectAfterFailures is the consecutive PullMessages failure
 	// count that triggers a CreatePullPointSubscription recreate. The
 	// camera or pull-point can die for many reasons (camera reboot,
 	// subscription garbage-collected after a renew miss, intermediate
 	// NAT timeout); rebuilding the subscription is the only reliable
-	// recovery. Default: 3.
+	// recovery. Zero means default (3). To disable reconnect entirely
+	// set DisableReconnect=true.
 	ReconnectAfterFailures int
+	// DisableReconnect skips automatic CreatePullPointSubscription
+	// recreate. The pull loop will continue retrying against the
+	// original endpoint until ctx is cancelled. Useful for tests or
+	// callers managing recovery externally.
+	DisableReconnect bool
 	// RetryBackoff is the initial sleep between a pull/recreate failure
 	// and the next attempt. Recreate failures double this up to a 30s
-	// ceiling. Default: 1s.
+	// ceiling. Zero means default (1s).
 	RetryBackoff time.Duration
 	// BufferSize is the buffer size of the Events and Errors channels.
 	// Larger buffers absorb consumer hiccups at the cost of memory.
-	// Default: 16.
+	// Zero means default (16); use -1 for unbuffered (synchronous)
+	// channels.
 	BufferSize int
 }
 
 func defaultOptions() Options {
 	return Options{
 		PullTimeout:            5 * time.Second,
-		MessageLimit:           10,
+		MessageLimit:           32,
 		InitialTermination:     60 * time.Second,
 		RenewMargin:            10 * time.Second,
 		ReconnectAfterFailures: 3,
@@ -108,11 +124,16 @@ func (o Options) withDefaults() Options {
 	if o.RetryBackoff > 0 {
 		d.RetryBackoff = o.RetryBackoff
 	}
-	if o.BufferSize > 0 {
+	// BufferSize: zero -> default; negative -> 0 (unbuffered).
+	switch {
+	case o.BufferSize > 0:
 		d.BufferSize = o.BufferSize
+	case o.BufferSize < 0:
+		d.BufferSize = 0
 	}
 	d.DeviceID = o.DeviceID
-	d.TopicFilter = o.TopicFilter
+	d.RawTopicFilter = o.RawTopicFilter
+	d.DisableReconnect = o.DisableReconnect
 	return d
 }
 
@@ -280,7 +301,7 @@ func (s *Stream) pullLoop(ctx context.Context) {
 		if err != nil {
 			s.surfaceError(ErrPullFailed{Err: err})
 			failures++
-			if failures >= s.opts.ReconnectAfterFailures {
+			if !s.opts.DisableReconnect && failures >= s.opts.ReconnectAfterFailures {
 				justRecreated, cont := s.attemptRecreate(ctx, &failures, &recreateBackoff)
 				if !cont {
 					return
@@ -300,7 +321,7 @@ func (s *Stream) pullLoop(ctx context.Context) {
 		recreateBackoff = s.opts.RetryBackoff
 		observedAt := s.now()
 		for _, m := range msgs {
-			ev := Decode(m, s.opts.DeviceID, observedAt)
+			ev := decode(m, s.opts.DeviceID, observedAt)
 			if afterReconnect {
 				ev.AfterReconnect = true
 				// ONVIF replays current state with
@@ -399,11 +420,11 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 func createPullPoint(c caller, opts Options) (string, error) {
 	term := xsd.String(durationToXSD(opts.InitialTermination))
 	req := event.CreatePullPointSubscription{InitialTerminationTime: &term}
-	if opts.TopicFilter != "" {
+	if opts.RawTopicFilter != "" {
 		req.Filter = &event.FilterType{
 			TopicExpression: &event.TopicExpressionType{
 				Dialect:    xsd.String("http://www.onvif.org/ver10/tev/topicExpression/ConcreteSet"),
-				TopicKinds: xsd.String(opts.TopicFilter),
+				TopicKinds: xsd.String(opts.RawTopicFilter),
 			},
 		}
 	}

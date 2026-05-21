@@ -52,7 +52,7 @@ func TestDecode_MotionActive(t *testing.T) {
 		map[string]string{"IsMotion": "true"},
 	)
 
-	ev := Decode(in, "axis-cam-01", observedAt)
+	ev := decode(in, "axis-cam-01", observedAt)
 
 	assert.Equal(t, KindMotion, ev.Kind)
 	assert.Equal(t, StateActive, ev.State)
@@ -74,7 +74,7 @@ func TestDecode_MotionInactive(t *testing.T) {
 		nil,
 		map[string]string{"State": "false"},
 	)
-	ev := Decode(in, "dev", time.Now())
+	ev := decode(in, "dev", time.Now())
 	assert.Equal(t, KindMotion, ev.Kind)
 	assert.Equal(t, StateInactive, ev.State)
 }
@@ -88,7 +88,7 @@ func TestDecode_HanwhaNumericMotionValue(t *testing.T) {
 		nil,
 		map[string]string{"Motion": "1"},
 	)
-	ev := Decode(in, "dev", time.Now())
+	ev := decode(in, "dev", time.Now())
 	assert.Equal(t, KindMotion, ev.Kind)
 	assert.Equal(t, StateActive, ev.State)
 }
@@ -103,7 +103,7 @@ func TestDecode_AvigilonActiveLiteral(t *testing.T) {
 		map[string]string{"RelayToken": "Relay-1"},
 		map[string]string{"LogicalState": "active"},
 	)
-	ev := Decode(in, "dev", time.Now())
+	ev := decode(in, "dev", time.Now())
 	assert.Equal(t, KindDigitalOutput, ev.Kind)
 	assert.Equal(t, StateActive, ev.State)
 	assert.Equal(t, "Relay-1", ev.Source["RelayToken"])
@@ -124,7 +124,7 @@ func TestDecode_AxisObjectAnalyticsMultiItem(t *testing.T) {
 			"confidence": "92",
 		},
 	)
-	ev := Decode(in, "dev", time.Now())
+	ev := decode(in, "dev", time.Now())
 	assert.Equal(t, KindObjectDetected, ev.Kind)
 	assert.Equal(t, StateActive, ev.State)
 	assert.Equal(t, "Human", ev.Data["classType"])
@@ -142,7 +142,7 @@ func TestDecode_LineDetectorCrossedHasNoState(t *testing.T) {
 		map[string]string{"VideoSourceConfigurationToken": "vsct0", "Rule": "LineRule"},
 		map[string]string{"ObjectId": "42"},
 	)
-	ev := Decode(in, "dev", time.Now())
+	ev := decode(in, "dev", time.Now())
 	assert.Equal(t, KindObjectDetected, ev.Kind)
 	assert.Equal(t, StateUnknown, ev.State)
 	assert.Equal(t, "42", ev.Data["ObjectId"])
@@ -158,7 +158,7 @@ func TestDecode_UnknownTopicStillPreservesWireData(t *testing.T) {
 		nil,
 		map[string]string{"Custom": "true"},
 	)
-	ev := Decode(in, "dev", time.Now())
+	ev := decode(in, "dev", time.Now())
 	assert.Equal(t, KindUnknown, ev.Kind)
 	assert.Equal(t, "tns1:UserAlarm/IVA", ev.Topic)
 	assert.Equal(t, "true", ev.Data["Custom"])
@@ -179,7 +179,7 @@ func TestDecode_PropertyOperationVariants(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			in := msg("tns1:VideoSource/MotionAlarm", tc.in, "", nil, nil)
-			ev := Decode(in, "dev", time.Now())
+			ev := decode(in, "dev", time.Now())
 			assert.Equal(t, tc.want, ev.Operation)
 		})
 	}
@@ -200,7 +200,7 @@ func TestDecode_DeviceTimeParsing(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			in := msg("tns1:VideoSource/MotionAlarm", "Changed", tc.in, nil, nil)
-			ev := Decode(in, "dev", time.Now())
+			ev := decode(in, "dev", time.Now())
 			if tc.want.IsZero() {
 				assert.True(t, ev.DeviceTime.IsZero(), "DeviceTime=%v", ev.DeviceTime)
 			} else {
@@ -215,7 +215,7 @@ func TestDecode_EmptySourceAndDataYieldNilMaps(t *testing.T) {
 	// safely len() and index into Source/Data without nil-checking, but
 	// we do not allocate an empty map for empty notifications.
 	in := msg("tns1:VideoSource/MotionAlarm", "Changed", "", nil, nil)
-	ev := Decode(in, "dev", time.Now())
+	ev := decode(in, "dev", time.Now())
 	assert.Nil(t, ev.Source)
 	assert.Nil(t, ev.Data)
 }
@@ -242,7 +242,7 @@ func TestDecode_StateValueIsCaseInsensitive(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			in := msg("tns1:VideoSource/MotionAlarm", "Changed", "",
 				nil, map[string]string{"State": tc.value})
-			ev := Decode(in, "dev", time.Now())
+			ev := decode(in, "dev", time.Now())
 			assert.Equal(t, tc.want, ev.State)
 		})
 	}

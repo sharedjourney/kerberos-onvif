@@ -109,8 +109,8 @@ func parseDeviceTime(s string) time.Time {
 // firmwares. Ordered from most-precise / most-common first so the
 // happy path hits early.
 var deviceTimeLayouts = []string{
-	time.RFC3339Nano,            // 2026-05-21T10:30:00.500Z, ...+02:00
-	time.RFC3339,                // 2026-05-21T10:30:00Z, ...+02:00
+	time.RFC3339Nano,               // 2026-05-21T10:30:00.500Z, ...+02:00
+	time.RFC3339,                   // 2026-05-21T10:30:00Z, ...+02:00
 	"2006-01-02T15:04:05.999-0700", // sub-second + compact offset (Geovision)
 	"2006-01-02T15:04:05-0700",     // compact offset (some Dahua)
 	"2006-01-02T15:04:05.999",      // no timezone, sub-second (rare)

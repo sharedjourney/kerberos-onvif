@@ -72,9 +72,9 @@ func main() {
 	}()
 
 	s, err := stream.NewStream(ctx, dev, stream.Options{
-		DeviceID:    *deviceID,
+		DeviceID:       *deviceID,
 		RawTopicFilter: *filter,
-		PullTimeout: *pullTimeout,
+		PullTimeout:    *pullTimeout,
 	})
 	if err != nil {
 		log.Fatalf("open stream: %v", err)

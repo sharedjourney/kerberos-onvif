@@ -1,6 +1,10 @@
 package stream
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+)
 
 func TestClassifyTopic(t *testing.T) {
 	tests := []struct {
@@ -88,9 +92,7 @@ func TestClassifyTopic(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := Classify(tc.topic); got != tc.want {
-				t.Errorf("Classify(%q) = %v, want %v", tc.topic, got, tc.want)
-			}
+			assert.Equal(t, tc.want, Classify(tc.topic), "topic=%q", tc.topic)
 		})
 	}
 }
@@ -98,9 +100,7 @@ func TestClassifyTopic(t *testing.T) {
 func TestClassifyIsCaseSensitive(t *testing.T) {
 	// ONVIF topic identifiers are case-sensitive per the spec; a
 	// lowercased topic must not match a capitalised pattern.
-	if got := Classify("tns1:videosource/motionalarm"); got != KindUnknown {
-		t.Errorf("Classify lowercase = %v, want KindUnknown (topics are case-sensitive)", got)
-	}
+	assert.Equal(t, KindUnknown, Classify("tns1:videosource/motionalarm"))
 }
 
 func TestCanonicalizeTopicStripsNamespaces(t *testing.T) {
@@ -114,8 +114,6 @@ func TestCanonicalizeTopicStripsNamespaces(t *testing.T) {
 		{"", ""},
 	}
 	for _, tc := range tests {
-		if got := canonicalizeTopic(tc.in); got != tc.want {
-			t.Errorf("canonicalizeTopic(%q) = %q, want %q", tc.in, got, tc.want)
-		}
+		assert.Equal(t, tc.want, canonicalizeTopic(tc.in), "input=%q", tc.in)
 	}
 }

@@ -3,6 +3,8 @@ package stream
 import (
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestEventKindString(t *testing.T) {
@@ -20,9 +22,7 @@ func TestEventKindString(t *testing.T) {
 		{EventKind(255), "EventKind(255)"},
 	}
 	for _, tc := range tests {
-		if got := tc.kind.String(); got != tc.want {
-			t.Errorf("EventKind(%d).String() = %q, want %q", tc.kind, got, tc.want)
-		}
+		assert.Equal(t, tc.want, tc.kind.String())
 	}
 }
 
@@ -37,9 +37,7 @@ func TestEventStateString(t *testing.T) {
 		{EventState(255), "EventState(255)"},
 	}
 	for _, tc := range tests {
-		if got := tc.state.String(); got != tc.want {
-			t.Errorf("EventState(%d).String() = %q, want %q", tc.state, got, tc.want)
-		}
+		assert.Equal(t, tc.want, tc.state.String())
 	}
 }
 
@@ -55,29 +53,19 @@ func TestPropertyOperationString(t *testing.T) {
 		{PropertyOperation(255), "PropertyOperation(255)"},
 	}
 	for _, tc := range tests {
-		if got := tc.op.String(); got != tc.want {
-			t.Errorf("PropertyOperation(%d).String() = %q, want %q", tc.op, got, tc.want)
-		}
+		assert.Equal(t, tc.want, tc.op.String())
 	}
 }
 
 func TestEventZeroValue(t *testing.T) {
 	var e Event
-	if e.Kind != KindUnknown {
-		t.Errorf("zero Event.Kind = %v, want KindUnknown", e.Kind)
-	}
-	if e.State != StateUnknown {
-		t.Errorf("zero Event.State = %v, want StateUnknown", e.State)
-	}
-	if !e.Timestamp.IsZero() {
-		t.Errorf("zero Event.Timestamp = %v, want zero time", e.Timestamp)
-	}
+	assert.Equal(t, KindUnknown, e.Kind)
+	assert.Equal(t, StateUnknown, e.State)
+	assert.True(t, e.Timestamp.IsZero())
 }
 
 func TestEventTimestampPreserved(t *testing.T) {
 	now := time.Now()
 	e := Event{Timestamp: now}
-	if !e.Timestamp.Equal(now) {
-		t.Errorf("Event.Timestamp = %v, want %v", e.Timestamp, now)
-	}
+	assert.True(t, e.Timestamp.Equal(now))
 }

@@ -44,11 +44,11 @@ func TestStream_RecreatesSubscriptionAfterRepeatedPullErrors(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	s, err := newStream(ctx, fc, Options{
-		DeviceID:                "cam-1",
-		PullTimeout:             50 * time.Millisecond,
-		ReconnectAfterFailures:  1,
-		RetryBackoff:            10 * time.Millisecond,
-		InitialTermination:      30 * time.Second, // keep renew quiet
+		DeviceID:               "cam-1",
+		PullTimeout:            50 * time.Millisecond,
+		ReconnectAfterFailures: 1,
+		RetryBackoff:           10 * time.Millisecond,
+		InitialTermination:     30 * time.Second, // keep renew quiet
 	})
 	require.NoError(t, err)
 	defer s.Close()

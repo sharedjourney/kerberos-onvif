@@ -45,6 +45,17 @@ type Options struct {
 	// renew loop fires. Larger margins tolerate slower networks at the
 	// cost of more renew SOAP calls. Default: 10s.
 	RenewMargin time.Duration
+	// ReconnectAfterFailures is the consecutive PullMessages failure
+	// count that triggers a CreatePullPointSubscription recreate. The
+	// camera or pull-point can die for many reasons (camera reboot,
+	// subscription garbage-collected after a renew miss, intermediate
+	// NAT timeout); rebuilding the subscription is the only reliable
+	// recovery. Default: 3.
+	ReconnectAfterFailures int
+	// RetryBackoff is the initial sleep between a pull/recreate failure
+	// and the next attempt. Recreate failures double this up to a 30s
+	// ceiling. Default: 1s.
+	RetryBackoff time.Duration
 	// BufferSize is the buffer size of the Events and Errors channels.
 	// Larger buffers absorb consumer hiccups at the cost of memory.
 	// Default: 16.
@@ -53,11 +64,13 @@ type Options struct {
 
 func defaultOptions() Options {
 	return Options{
-		PullTimeout:        5 * time.Second,
-		MessageLimit:       10,
-		InitialTermination: 60 * time.Second,
-		RenewMargin:        10 * time.Second,
-		BufferSize:         16,
+		PullTimeout:            5 * time.Second,
+		MessageLimit:           10,
+		InitialTermination:     60 * time.Second,
+		RenewMargin:            10 * time.Second,
+		ReconnectAfterFailures: 3,
+		RetryBackoff:           time.Second,
+		BufferSize:             16,
 	}
 }
 
@@ -75,6 +88,12 @@ func (o Options) withDefaults() Options {
 	if o.RenewMargin > 0 {
 		d.RenewMargin = o.RenewMargin
 	}
+	if o.ReconnectAfterFailures > 0 {
+		d.ReconnectAfterFailures = o.ReconnectAfterFailures
+	}
+	if o.RetryBackoff > 0 {
+		d.RetryBackoff = o.RetryBackoff
+	}
 	if o.BufferSize > 0 {
 		d.BufferSize = o.BufferSize
 	}
@@ -82,6 +101,9 @@ func (o Options) withDefaults() Options {
 	d.TopicFilter = o.TopicFilter
 	return d
 }
+
+// maxRecreateBackoff caps exponential backoff between recreate attempts.
+const maxRecreateBackoff = 30 * time.Second
 
 // caller is the subset of *onvif.Device the Stream depends on. Tests
 // substitute a fake; production code uses the device adapter.
@@ -107,9 +129,11 @@ func (d deviceCaller) SendSoap(endpoint, body string) (*http.Response, error) {
 // A Stream is safe for concurrent use by Close from any goroutine while
 // readers consume Events / Errors; Close is idempotent.
 type Stream struct {
-	caller    caller
-	opts      Options
-	pullPoint string
+	caller caller
+	opts   Options
+
+	pullPointMu sync.Mutex
+	pullPoint   string
 
 	events chan Event
 	errors chan error
@@ -122,6 +146,18 @@ type Stream struct {
 
 	// now is overridable in tests to make timestamps deterministic.
 	now func() time.Time
+}
+
+func (s *Stream) getPullPoint() string {
+	s.pullPointMu.Lock()
+	defer s.pullPointMu.Unlock()
+	return s.pullPoint
+}
+
+func (s *Stream) setPullPoint(addr string) {
+	s.pullPointMu.Lock()
+	defer s.pullPointMu.Unlock()
+	s.pullPoint = addr
 }
 
 // NewStream creates a Stream against an ONVIF device. It performs the
@@ -175,7 +211,7 @@ func (s *Stream) Close() error {
 		// Unsubscribe is best-effort: if the camera is unreachable
 		// the subscription will expire on its own at
 		// InitialTermination + Renew interval anyway.
-		if err := unsubscribePullPoint(s.caller, s.pullPoint); err != nil {
+		if err := unsubscribePullPoint(s.caller, s.getPullPoint()); err != nil {
 			s.closeErr = fmt.Errorf("unsubscribe pull point: %w", err)
 		}
 	})
@@ -198,21 +234,31 @@ func (s *Stream) run(ctx context.Context) {
 }
 
 func (s *Stream) pullLoop(ctx context.Context) {
+	var failures int
+	recreateBackoff := s.opts.RetryBackoff
+
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		msgs, err := pullMessages(s.caller, s.pullPoint, s.opts)
+		msgs, err := pullMessages(s.caller, s.getPullPoint(), s.opts)
 		if err != nil {
 			s.surfaceError(err)
-			// Brief backoff before retrying; automatic
-			// subscription recreation lands in the reconnect
-			// commit and replaces this fallback.
-			if !sleepCtx(ctx, time.Second) {
+			failures++
+			if failures >= s.opts.ReconnectAfterFailures {
+				if !s.attemptRecreate(ctx, &failures, &recreateBackoff) {
+					return
+				}
+				continue
+			}
+			if !sleepCtx(ctx, s.opts.RetryBackoff) {
 				return
 			}
 			continue
 		}
+		// Successful pull resets failure tracking.
+		failures = 0
+		recreateBackoff = s.opts.RetryBackoff
 		observedAt := s.now()
 		for _, m := range msgs {
 			ev := Decode(m, s.opts.DeviceID, observedAt)
@@ -223,6 +269,29 @@ func (s *Stream) pullLoop(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// attemptRecreate calls CreatePullPointSubscription and on success
+// installs the new endpoint atomically. Returns false if ctx was
+// cancelled while waiting for backoff (caller should exit the run
+// loop).
+func (s *Stream) attemptRecreate(ctx context.Context, failures *int, backoff *time.Duration) bool {
+	addr, err := createPullPoint(s.caller, s.opts)
+	if err != nil {
+		s.surfaceError(fmt.Errorf("recreate pull point: %w", err))
+		if !sleepCtx(ctx, *backoff) {
+			return false
+		}
+		*backoff *= 2
+		if *backoff > maxRecreateBackoff {
+			*backoff = maxRecreateBackoff
+		}
+		return true
+	}
+	s.setPullPoint(addr)
+	*failures = 0
+	*backoff = s.opts.RetryBackoff
+	return true
 }
 
 // renewLoop refreshes the subscription before InitialTermination expires.
@@ -245,7 +314,7 @@ func (s *Stream) renewLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := renewPullPoint(s.caller, s.pullPoint, s.opts); err != nil {
+			if err := renewPullPoint(s.caller, s.getPullPoint(), s.opts); err != nil {
 				s.surfaceError(fmt.Errorf("renew pull point: %w", err))
 			}
 		}

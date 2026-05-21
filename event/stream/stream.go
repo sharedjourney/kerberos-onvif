@@ -38,9 +38,13 @@ type Options struct {
 	// returned per PullMessages call. Default: 10.
 	MessageLimit int
 	// InitialTermination is the requested subscription lifetime passed
-	// to CreatePullPointSubscription. The renew loop (added in a later
-	// commit) will refresh well before this expires. Default: 60s.
+	// to CreatePullPointSubscription. The renew loop refreshes well
+	// before this expires. Default: 60s.
 	InitialTermination time.Duration
+	// RenewMargin is how long before InitialTermination expiry the
+	// renew loop fires. Larger margins tolerate slower networks at the
+	// cost of more renew SOAP calls. Default: 10s.
+	RenewMargin time.Duration
 	// BufferSize is the buffer size of the Events and Errors channels.
 	// Larger buffers absorb consumer hiccups at the cost of memory.
 	// Default: 16.
@@ -52,6 +56,7 @@ func defaultOptions() Options {
 		PullTimeout:        5 * time.Second,
 		MessageLimit:       10,
 		InitialTermination: 60 * time.Second,
+		RenewMargin:        10 * time.Second,
 		BufferSize:         16,
 	}
 }
@@ -66,6 +71,9 @@ func (o Options) withDefaults() Options {
 	}
 	if o.InitialTermination > 0 {
 		d.InitialTermination = o.InitialTermination
+	}
+	if o.RenewMargin > 0 {
+		d.RenewMargin = o.RenewMargin
 	}
 	if o.BufferSize > 0 {
 		d.BufferSize = o.BufferSize
@@ -179,6 +187,17 @@ func (s *Stream) run(ctx context.Context) {
 	defer close(s.events)
 	defer close(s.errors)
 
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		s.renewLoop(ctx)
+	}()
+	s.pullLoop(ctx)
+	wg.Wait()
+}
+
+func (s *Stream) pullLoop(ctx context.Context) {
 	for {
 		if ctx.Err() != nil {
 			return
@@ -186,9 +205,9 @@ func (s *Stream) run(ctx context.Context) {
 		msgs, err := pullMessages(s.caller, s.pullPoint, s.opts)
 		if err != nil {
 			s.surfaceError(err)
-			// Brief backoff before retrying; reconnect-on-error
-			// lands in a follow-up commit and replaces this with
-			// proper subscription recreation.
+			// Brief backoff before retrying; automatic
+			// subscription recreation lands in the reconnect
+			// commit and replaces this fallback.
 			if !sleepCtx(ctx, time.Second) {
 				return
 			}
@@ -201,6 +220,33 @@ func (s *Stream) run(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case s.events <- ev:
+			}
+		}
+	}
+}
+
+// renewLoop refreshes the subscription before InitialTermination expires.
+// Exits when ctx is cancelled.
+func (s *Stream) renewLoop(ctx context.Context) {
+	interval := s.opts.InitialTermination - s.opts.RenewMargin
+	if interval <= 0 {
+		// Pathological config (margin >= termination): fall back to
+		// renewing at half the termination so we still refresh,
+		// rather than busy-looping or never renewing.
+		interval = s.opts.InitialTermination / 2
+		if interval <= 0 {
+			interval = time.Second
+		}
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := renewPullPoint(s.caller, s.pullPoint, s.opts); err != nil {
+				s.surfaceError(fmt.Errorf("renew pull point: %w", err))
 			}
 		}
 	}
@@ -282,6 +328,20 @@ func pullMessages(c caller, endpoint string, opts Options) ([]event.Notification
 		return nil, err
 	}
 	return decoded.NotificationMessage, nil
+}
+
+func renewPullPoint(c caller, endpoint string, opts Options) error {
+	req := event.Renew{TerminationTime: xsd.String(durationToXSD(opts.InitialTermination))}
+	body, err := xml.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("marshal Renew: %w", err)
+	}
+	resp, err := c.SendSoap(endpoint, string(body))
+	if err != nil {
+		return err
+	}
+	_, err = readClose(resp)
+	return err
 }
 
 func unsubscribePullPoint(c caller, endpoint string) error {

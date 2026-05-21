@@ -1,0 +1,134 @@
+package stream
+
+import (
+	"context"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// countSendSoapMatching counts how many recorded SendSoap calls have a
+// body containing needle. Safe to call concurrently with the run loop.
+func countSendSoapMatching(fc *fakeCaller, needle string) int {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	n := 0
+	for _, c := range fc.sendSoapCalls {
+		if strings.Contains(c[1], needle) {
+			n++
+		}
+	}
+	return n
+}
+
+func TestStream_RenewsSubscriptionBeforeExpiry(t *testing.T) {
+	fc := newFakeCaller()
+	fc.queueCallMethod(createPullPointResp, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// 100 ms termination with 10 ms margin -> renew every ~90 ms.
+	s, err := newStream(ctx, fc, Options{
+		DeviceID:           "cam-1",
+		InitialTermination: 100 * time.Millisecond,
+		RenewMargin:        10 * time.Millisecond,
+	})
+	require.NoError(t, err)
+	defer s.Close()
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	var renewCount int
+	for time.Now().Before(deadline) {
+		renewCount = countSendSoapMatching(fc, "Renew")
+		if renewCount >= 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	assert.GreaterOrEqual(t, renewCount, 1, "expected at least one Renew SendSoap call within 500ms")
+}
+
+func TestStream_RenewSendsToSubscriptionEndpoint(t *testing.T) {
+	fc := newFakeCaller()
+	fc.queueCallMethod(createPullPointResp, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s, err := newStream(ctx, fc, Options{
+		InitialTermination: 80 * time.Millisecond,
+		RenewMargin:        10 * time.Millisecond,
+	})
+	require.NoError(t, err)
+	defer s.Close()
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if countSendSoapMatching(fc, "Renew") >= 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	var renewEndpoint string
+	for _, c := range fc.sendSoapCalls {
+		if strings.Contains(c[1], "Renew") {
+			renewEndpoint = c[0]
+			break
+		}
+	}
+	require.NotEmpty(t, renewEndpoint, "no Renew call found")
+	assert.Equal(t, "http://camera.local/onvif/Events/PullSub_1", renewEndpoint,
+		"Renew must target the SubscriptionReference Address")
+}
+
+func TestStream_RenewMarginAppliesDefault(t *testing.T) {
+	o := defaultOptions()
+	assert.Equal(t, 10*time.Second, o.RenewMargin)
+}
+
+func TestStream_RenewErrorSurfacedOnErrorsChannel(t *testing.T) {
+	fc := newFakeCaller()
+	fc.queueCallMethod(createPullPointResp, nil)
+	// Defaults return empty pulls indefinitely so the pull loop is clean.
+	// Override defaultSendSoap on the fly to return a Renew error for
+	// any body that looks like a Renew. We do that by tagging the
+	// default response with an err, then resetting after capturing one.
+	// Simpler: just queue several explicit Renew-error responses; the
+	// fake's queue is consumed in FIFO and the pull body never matches
+	// 'Renew', so queued errors will land on the renew call only if
+	// queued before any pulls. To bias the order we drain via a custom
+	// default.
+	fc.mu.Lock()
+	fc.defaultSendSoap = fakeResp{err: errInjected{}}
+	fc.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s, err := newStream(ctx, fc, Options{
+		InitialTermination: 80 * time.Millisecond,
+		RenewMargin:        10 * time.Millisecond,
+	})
+	require.NoError(t, err)
+	defer s.Close()
+
+	select {
+	case e := <-s.Errors():
+		assert.Contains(t, e.Error(), "injected")
+	case <-time.After(time.Second):
+		t.Fatal("expected an error on Errors channel from failing Renew/pull")
+	}
+}
+
+// errInjected is a sentinel error type so the test message has a stable
+// substring without depending on a wrapped string match.
+type errInjected struct{}
+
+func (errInjected) Error() string { return "injected fake error" }

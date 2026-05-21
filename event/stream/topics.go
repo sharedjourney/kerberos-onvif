@@ -168,7 +168,7 @@ var topicRules = []struct {
 	// tns1:RuleEngine/LineDetector/Crossed — line crossing (Hikvision,
 	// Bosch IVA, others). Data: ObjectId (xsd:int); edge-triggered, no
 	// State boolean.
-	// ONVIF-VideoAnalytics-Service-Spec-v220.pdf §5.4
+	// https://www.onvif.org/specs/srv/analytics/ONVIF-VideoAnalytics-Service-Spec-v220.pdf §5.4
 	{"LineDetector/Crossed", KindObjectDetected},
 
 	// tns1:RuleEngine/FieldDetector/ObjectsInside — intrusion / region

@@ -10,72 +10,58 @@ func TestClassifyTopic(t *testing.T) {
 	tests := []struct {
 		name  string
 		topic string
-		want  EventKind
+		want  Kind
 	}{
 		// --- Motion -----------------------------------------------------
 
-		// Profile S basic motion (AXIS basic VMD, Bosch, Dahua,
-		// Hikvision newer firmware, Hanwha fallback). Data: State.
 		{"video_source_motion_alarm", "tns1:VideoSource/MotionAlarm", KindMotion},
-
-		// ONVIF Analytics rule (AXIS, Hikvision standard, Avigilon
-		// analytics). Data: IsMotion.
 		{"cell_motion_detector", "tns1:RuleEngine/CellMotionDetector/Motion", KindMotion},
-
-		// AXIS region rule. Data: IsMotion.
 		{"motion_region_detector", "tns1:RuleEngine/MotionRegionDetector/Motion", KindMotion},
-
-		// Bosch publishes motion under VideoAnalytics (not VideoSource).
 		{"bosch_video_analytics_motion", "tns1:VideoAnalytics/MotionAlarm", KindMotion},
-
-		// Hanwha (Samsung/Wisenet) vendor-namespaced motion.
 		{"hanwha_samsung_motion", "tns1:VideoAnalytics/tnssamsung:MotionDetection", KindMotion},
 
-		// --- Tampering / scene change ----------------------------------
+		// AXIS Guard suite — vendor analytics apps.
+		{"axis_motion_guard", "tnsaxis:CameraApplicationPlatform/MotionGuard/Camera1ProfileANY", KindMotion},
+		{"axis_fence_guard", "tnsaxis:CameraApplicationPlatform/FenceGuard/Camera1ProfileANY", KindMotion},
+		{"axis_loitering_guard", "tnsaxis:CameraApplicationPlatform/LoiteringGuard/Camera1ProfileANY", KindMotion},
 
-		// ONVIF RuleEngine tamper rule. Data: IsTamper.
+		// --- Tampering --------------------------------------------------
+
 		{"tamper_detector", "tns1:RuleEngine/TamperDetector/Tamper", KindTampering},
-
-		// Hikvision uses VideoSource/Image* topics for tamper-class
-		// signals on firmwares without TamperDetector.
-		{"hikvision_image_too_dark", "tns1:VideoSource/ImageTooDark/ImagingService", KindTampering},
-		{"hikvision_image_too_bright", "tns1:VideoSource/ImageTooBright/ImagingService", KindTampering},
-		{"hikvision_image_too_blurry", "tns1:VideoSource/ImageTooBlurry/ImagingService", KindTampering},
-
-		// Hanwha vendor-namespaced tampering.
+		{"global_scene_change", "tns1:VideoSource/GlobalSceneChange/ImagingService", KindTampering},
 		{"hanwha_tampering", "tns1:VideoAnalytics/tnssamsung:TamperingDetection", KindTampering},
+
+		// --- Image quality (separated from Tampering) ------------------
+
+		{"image_too_dark", "tns1:VideoSource/ImageTooDark/ImagingService", KindImageQuality},
+		{"image_too_bright", "tns1:VideoSource/ImageTooBright/ImagingService", KindImageQuality},
+		{"image_too_blurry", "tns1:VideoSource/ImageTooBlurry/ImagingService", KindImageQuality},
 
 		// --- Digital input ---------------------------------------------
 
-		// Standard ONVIF Device IO topic — same across all vendors that
-		// follow the spec.
 		{"digital_input", "tns1:Device/Trigger/DigitalInput", KindDigitalInput},
-
-		// Avigilon serialises every path segment with a namespace prefix.
 		{"digital_input_avigilon", "tns1:Device/tns1:Trigger/tns1:DigitalInput", KindDigitalInput},
 
-		// --- Digital output / relay ------------------------------------
+		// --- Digital output --------------------------------------------
 
 		{"relay", "tns1:Device/Trigger/Relay", KindDigitalOutput},
 		{"relay_avigilon", "tns1:Device/tns1:Trigger/tns1:Relay", KindDigitalOutput},
 
 		// --- Object analytics ------------------------------------------
 
-		// AXIS Object Analytics scenarios — the suffix is dynamic
-		// (Device1Scenario1, Device1ScenarioANY, ...).
-		{"axis_object_analytics_scenario_any", "tnsaxis:CameraApplicationPlatform/ObjectAnalytics/Device1ScenarioANY", KindObjectDetected},
+		// AXIS Object Analytics uses numeric scenario suffixes.
 		{"axis_object_analytics_scenario_1", "tnsaxis:CameraApplicationPlatform/ObjectAnalytics/Device1Scenario1", KindObjectDetected},
+		{"axis_object_analytics_scenario_2", "tnsaxis:CameraApplicationPlatform/ObjectAnalytics/Device1Scenario2", KindObjectDetected},
 
-		// Hikvision line crossing.
+		// Standard rule-engine analytics topics.
 		{"line_detector_crossed", "tns1:RuleEngine/LineDetector/Crossed", KindObjectDetected},
-
-		// Region / intrusion detector.
 		{"field_detector_objects_inside", "tns1:RuleEngine/FieldDetector/ObjectsInside", KindObjectDetected},
 
-		// Bosch IVA / Dahua SMD publish vendor rule names under
-		// MyRuleDetector.
+		// Whitelisted MyRuleDetector sub-rules.
 		{"my_rule_detector_human", "tns1:RuleEngine/MyRuleDetector/HumanDetect", KindObjectDetected},
 		{"my_rule_detector_vehicle", "tns1:RuleEngine/MyRuleDetector/VehicleDetect", KindObjectDetected},
+		{"my_rule_detector_people", "tns1:RuleEngine/MyRuleDetector/PeopleDetect", KindObjectDetected},
+		{"my_rule_detector_face", "tns1:RuleEngine/MyRuleDetector/FaceDetect", KindObjectDetected},
 		{"my_rule_detector_objects_inside", "tns1:RuleEngine/MyRuleDetector/ObjectsInside", KindObjectDetected},
 
 		// --- Audio -----------------------------------------------------
@@ -89,6 +75,19 @@ func TestClassifyTopic(t *testing.T) {
 		{"empty", "", KindUnknown},
 		{"unknown_topic", "tns1:UserAlarm/IVA", KindUnknown},
 		{"unrelated_recording_config", "tns1:RecordingConfig/JobState", KindUnknown},
+
+		// MyRuleDetector overmatch guard — Bosch publishes counter and
+		// occupancy under the same container and these must not be
+		// classified as object detection.
+		{"my_rule_detector_counter_not_object", "tns1:RuleEngine/MyRuleDetector/Counter", KindUnknown},
+		{"my_rule_detector_occupancy_not_object", "tns1:RuleEngine/MyRuleDetector/Occupancy", KindUnknown},
+
+		// Substring guards.
+		{"motion_recording_not_motion", "tns1:Recording/MotionRecording/Started", KindUnknown},
+		{"audio_encoder_config_not_audio_alarm", "tns1:Configuration/AudioEncoderConfiguration", KindUnknown},
+		{"relay_failure_not_digital_output", "tns1:Device/HardwareFailure/RelayFailure", KindUnknown},
+		{"digital_input_config_not_digital_input", "tns1:Device/IO/DigitalInputConfiguration", KindUnknown},
+		{"tamper_detector_log_not_tampering", "tns1:Device/Diagnostics/TamperDetectorLog", KindUnknown},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -105,15 +104,35 @@ func TestClassifyIsCaseSensitive(t *testing.T) {
 
 func TestCanonicalizeTopicStripsNamespaces(t *testing.T) {
 	tests := []struct {
-		in, want string
+		name string
+		in   string
+		want string
 	}{
-		{"tns1:VideoSource/MotionAlarm", "VideoSource/MotionAlarm"},
-		{"tns1:Device/tns1:Trigger/tns1:Relay", "Device/Trigger/Relay"},
-		{"tns1:VideoAnalytics/tnssamsung:MotionDetection", "VideoAnalytics/MotionDetection"},
-		{"tnsaxis:CameraApplicationPlatform/ObjectAnalytics/Device1Scenario1", "CameraApplicationPlatform/ObjectAnalytics/Device1Scenario1"},
-		{"", ""},
+		{"single_namespace", "tns1:VideoSource/MotionAlarm", "VideoSource/MotionAlarm"},
+		{"per_segment_namespace", "tns1:Device/tns1:Trigger/tns1:Relay", "Device/Trigger/Relay"},
+		{"vendor_namespace_inner", "tns1:VideoAnalytics/tnssamsung:MotionDetection", "VideoAnalytics/MotionDetection"},
+		{"axis_outer_namespace", "tnsaxis:CameraApplicationPlatform/ObjectAnalytics/Device1Scenario1", "CameraApplicationPlatform/ObjectAnalytics/Device1Scenario1"},
+		{"empty", "", ""},
+		{"no_colon_passthrough", "Foo/Bar", "Foo/Bar"},
+		{"double_slash_keeps_empty_segment", "tns1://Foo", "//Foo"},
+		{"colon_only_segment_collapses_to_empty", "tns1:/Foo", "/Foo"},
+		{"trailing_colon_segment", "tns1:", ""},
+		{"multi_colon_takes_first", "tns1:Foo:Bar/Baz", "Foo:Bar/Baz"},
+		{"leading_slash_kept", "/tns1:Foo", "/Foo"},
+		{"trailing_slash_kept", "tns1:Foo/", "Foo/"},
 	}
 	for _, tc := range tests {
-		assert.Equal(t, tc.want, canonicalizeTopic(tc.in), "input=%q", tc.in)
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, canonicalizeTopic(tc.in), "input=%q", tc.in)
+		})
 	}
+}
+
+func TestClassifyRuleOrder_ObjectAnalyticsBeforeGenericObjects(t *testing.T) {
+	// Locks the invariant that the prefix rule "ObjectAnalytics/" is
+	// matched before the broader "ObjectsInside" rule. Without this
+	// ordering, AXIS AOA topics that contain neither would still classify
+	// correctly via the ObjectAnalytics/ rule; we encode the dependency.
+	topic := "tnsaxis:CameraApplicationPlatform/ObjectAnalytics/Device1Scenario1"
+	assert.Equal(t, KindObjectDetected, Classify(topic))
 }

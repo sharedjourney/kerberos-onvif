@@ -5,19 +5,25 @@ import (
 	"time"
 )
 
-// EventKind is the normalized category of an ONVIF event, independent of the
+// Kind is the normalized category of an ONVIF event, independent of the
 // camera vendor's topic naming.
-type EventKind uint8
+type Kind uint8
 
 const (
 	// KindUnknown is the zero value; used when a topic does not match any
 	// known classification.
-	KindUnknown EventKind = iota
+	KindUnknown Kind = iota
 	// KindMotion covers motion detection from any vendor (e.g. AXIS
 	// VideoSource/MotionAlarm, Hikvision RuleEngine/CellMotionDetector).
 	KindMotion
-	// KindTampering covers camera tampering / scene change alarms.
+	// KindTampering covers true tamper alarms (lens cover, scene
+	// substitution). Imaging-quality alarms map to KindImageQuality.
 	KindTampering
+	// KindImageQuality covers VideoSource imaging alarms such as
+	// ImageTooDark, ImageTooBright and ImageTooBlurry. Most integrators
+	// treat these separately from tamper because they fire on legitimate
+	// sunset/dawn/condensation transitions.
+	KindImageQuality
 	// KindDigitalInput covers external sensor inputs wired to the camera.
 	KindDigitalInput
 	// KindDigitalOutput covers relay output state changes on the camera.
@@ -30,7 +36,7 @@ const (
 )
 
 // String implements fmt.Stringer.
-func (k EventKind) String() string {
+func (k Kind) String() string {
 	switch k {
 	case KindUnknown:
 		return "Unknown"
@@ -38,6 +44,8 @@ func (k EventKind) String() string {
 		return "Motion"
 	case KindTampering:
 		return "Tampering"
+	case KindImageQuality:
+		return "ImageQuality"
 	case KindDigitalInput:
 		return "DigitalInput"
 	case KindDigitalOutput:
@@ -47,23 +55,24 @@ func (k EventKind) String() string {
 	case KindAudioAlarm:
 		return "AudioAlarm"
 	default:
-		return fmt.Sprintf("EventKind(%d)", uint8(k))
+		return fmt.Sprintf("Kind(%d)", uint8(k))
 	}
 }
 
-// EventState is the active/inactive state carried by an event. Most ONVIF
-// alarms are boolean (e.g. IsMotion=true/false); StateUnknown is used when
-// the value cannot be parsed.
-type EventState uint8
+// State is the active/inactive level carried by a boolean ONVIF property
+// event (e.g. IsMotion=true/false). StateUnknown is used both when the
+// value cannot be parsed and when the topic is edge-triggered and carries
+// no boolean state (e.g. LineDetector/Crossed).
+type State uint8
 
 const (
-	StateUnknown EventState = iota
+	StateUnknown State = iota
 	StateActive
 	StateInactive
 )
 
 // String implements fmt.Stringer.
-func (s EventState) String() string {
+func (s State) String() string {
 	switch s {
 	case StateUnknown:
 		return "Unknown"
@@ -72,13 +81,15 @@ func (s EventState) String() string {
 	case StateInactive:
 		return "Inactive"
 	default:
-		return fmt.Sprintf("EventState(%d)", uint8(s))
+		return fmt.Sprintf("State(%d)", uint8(s))
 	}
 }
 
 // PropertyOperation mirrors the ONVIF wsnt:PropertyOperation attribute and
 // indicates whether a message is the first sighting of a property
-// (Initialized), a transition (Changed) or the property going away (Deleted).
+// (Initialized), a transition (Changed) or the property going away
+// (Deleted). PropertyUnknown is used both when the attribute is absent on
+// the wire (the spec allows it) and when the value is unrecognised.
 type PropertyOperation uint8
 
 const (
@@ -107,24 +118,45 @@ func (p PropertyOperation) String() string {
 // Event is a single normalized notification from an ONVIF device.
 //
 // Kind, State and Operation are the normalized fields most callers should
-// switch on. Topic, RawValue and Source preserve the original ONVIF data so
-// callers can do further inspection or logging without re-parsing SOAP.
+// switch on. Topic, Source and Data preserve the original ONVIF data so
+// callers can inspect the wire form without re-parsing SOAP.
+//
+// Source and Data are maps from ONVIF SimpleItem Name to Value because
+// notifications can carry multiple items: AXIS Object Analytics for
+// example emits active, classType and confidence in the same Data list,
+// and standard DigitalInput notifications carry both InputToken in Source
+// and LogicalState in Data.
 type Event struct {
 	// Kind is the normalized event category.
-	Kind EventKind
-	// State is the active/inactive value carried by the event.
-	State EventState
-	// Operation is the ONVIF property lifecycle (Initialized/Changed/Deleted).
+	Kind Kind
+	// State is the active/inactive value carried by a boolean event.
+	// StateUnknown for edge-triggered events (LineDetector/Crossed) that
+	// carry no boolean property.
+	State State
+	// Operation is the ONVIF property lifecycle
+	// (Initialized/Changed/Deleted).
 	Operation PropertyOperation
-	// Source identifies the channel, input, or rule that produced the event
-	// (taken from the Source SimpleItem in the notification).
-	Source string
-	// Topic is the raw ONVIF topic string, e.g. tns1:VideoSource/MotionAlarm.
+	// DeviceID identifies the camera that produced the event. Set by the
+	// Stream from the caller-supplied identifier so a single channel can
+	// fan in events from multiple devices.
+	DeviceID string
+	// Source is the ONVIF Source SimpleItem map (e.g. InputToken,
+	// VideoSourceConfigurationToken, Rule). Empty when the notification
+	// has no Source section.
+	Source map[string]string
+	// Data is the ONVIF Data SimpleItem map (e.g. IsMotion, LogicalState,
+	// active, classType). Empty when the notification has no Data
+	// section.
+	Data map[string]string
+	// Topic is the raw ONVIF topic string, e.g.
+	// tns1:VideoSource/MotionAlarm.
 	Topic string
-	// RawValue is the unparsed Data SimpleItem value (e.g. "true", "1",
-	// "active") so callers can read non-boolean values when needed.
-	RawValue string
-	// Timestamp is when the stream observed the event locally. The ONVIF
-	// UtcTime is not used because clocks on many cameras drift.
+	// Timestamp is when the stream observed the event locally.
 	Timestamp time.Time
+	// DeviceTime is the camera-reported wsnt:UtcTime, when present and
+	// parseable. Zero if the camera omits the attribute or sends an
+	// unparseable value. Many cameras have drifting clocks; prefer
+	// Timestamp for ordering and DeviceTime only for forensics or
+	// cross-camera correlation when caller manages NTP.
+	DeviceTime time.Time
 }

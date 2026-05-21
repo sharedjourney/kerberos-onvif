@@ -1,13 +1,13 @@
-// Package stream provides a long-running, channel-based consumer for ONVIF
-// device events. It hides the SOAP/XML, pull-point lifecycle, renewal and
-// vendor-specific topic conventions behind a typed Event stream.
+// Package stream will provide a long-running, channel-based consumer for
+// ONVIF device events. It is meant to hide the SOAP/XML, pull-point
+// subscription lifecycle, subscription renewal and vendor-specific topic
+// conventions behind a typed Event stream.
 //
-// A Stream is created with NewStream and yields decoded Event values on the
-// channel returned by Events. Non-fatal errors (transient SOAP failures that
-// the stream recovers from) are surfaced on Errors. The Stream is stopped by
-// cancelling the context passed to NewStream or by calling Close.
+// This file lays down the value types (Kind, State, PropertyOperation,
+// Event) and the topic Classifier. The Stream type, its NewStream
+// constructor and the Events/Errors channels land in follow-up changes.
 //
 // The package classifies vendor-specific topic strings (AXIS, Hikvision,
-// Avigilon, Hanwha, Bosch, Dahua) into a small set of normalized EventKind
+// Avigilon, Hanwha, Bosch, Dahua) into a small set of normalized Kind
 // values so callers do not need to special-case device manufacturers.
 package stream

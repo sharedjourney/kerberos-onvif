@@ -3,7 +3,7 @@ package stream
 import "strings"
 
 // Classify maps an ONVIF topic string (e.g. "tns1:VideoSource/MotionAlarm")
-// to the normalized EventKind that callers should switch on. Returns
+// to the normalized Kind that callers should switch on. Returns
 // KindUnknown when no rule matches.
 //
 // The classifier strips XML-namespace prefixes (tns1:, tnsaxis:,
@@ -21,7 +21,7 @@ import "strings"
 //   - openvideolibs/onvif-parsers (Apache-2.0) — empirical topic table
 //     extracted from Home Assistant ONVIF integration
 //     https://github.com/openvideolibs/onvif-parsers
-func Classify(topic string) EventKind {
+func Classify(topic string) Kind {
 	if topic == "" {
 		return KindUnknown
 	}
@@ -39,6 +39,10 @@ func Classify(topic string) EventKind {
 // vendor variants like "tns1:Device/tns1:Trigger/tns1:Relay" (Avigilon
 // serialisation) and "tns1:Device/Trigger/Relay" (everyone else) to a
 // single matchable form.
+//
+// A segment that is only a prefix (e.g. "tns1:") canonicalizes to the
+// empty string. Multiple colons in one segment are not expected in real
+// ONVIF topics; the first colon wins.
 func canonicalizeTopic(topic string) string {
 	segments := strings.Split(topic, "/")
 	for i, seg := range segments {
@@ -51,11 +55,21 @@ func canonicalizeTopic(topic string) string {
 
 // topicRules is evaluated in order; first match wins. Keep more specific
 // rules ahead of broader ones — e.g. "ObjectAnalytics/" must precede any
-// future bare "Analytics" rule. Each rule cites the documentation that
-// supports including it.
+// future bare "Analytics" rule, and "MyRuleDetector/HumanDetect" must
+// precede a hypothetical broader "MyRuleDetector" entry. Each rule cites
+// the documentation that supports including it.
+//
+// Substring matching is intentional so vendor-specific path prefixes
+// outside the standard tns1: namespace (e.g.
+// tnsaxis:CameraApplicationPlatform/...) still match.
+//
+// Note on edge-triggered topics: tns1:RuleEngine/LineDetector/Crossed
+// carries an ObjectId rather than a State boolean. Consumers of Crossed
+// must not expect a level-triggered Active/Inactive semantic — the Stream
+// decoder will leave State as StateUnknown for these.
 var topicRules = []struct {
 	needle string
-	kind   EventKind
+	kind   Kind
 }{
 	// ---------- Motion -------------------------------------------------
 
@@ -88,69 +102,90 @@ var topicRules = []struct {
 	// https://developer.axis.com/vapix/network-video/event-and-action-services/
 	{"MotionRegionDetector/Motion", KindMotion},
 
+	// AXIS Guard suite — vendor analytics apps that fire motion-like
+	// events with Camera<N>Profile<ID> suffixes. Treated as motion so
+	// they can drive motion-triggered recording on cameras configured
+	// with these apps instead of basic VMD.
+	// https://developer.axis.com/vapix/applications/motion-guard
+	{"CameraApplicationPlatform/MotionGuard/", KindMotion},
+	{"CameraApplicationPlatform/FenceGuard/", KindMotion},
+	{"CameraApplicationPlatform/LoiteringGuard/", KindMotion},
+
 	// ---------- Tampering ---------------------------------------------
 
 	// tns1:RuleEngine/TamperDetector/Tamper — standard ONVIF tamper
-	// rule. Data: IsTamper (xsd:boolean).
+	// rule. Data: IsTamper (xsd:boolean). Anchored on the rule-name
+	// segment so "TamperDetectorLog" (hypothetical) does not match.
 	// ONVIF-VideoAnalytics-Service-Spec-v220.pdf §5.5
-	{"TamperDetector", KindTampering},
+	{"TamperDetector/Tamper", KindTampering},
 
-	// tns1:VideoSource/ImageTooDark|ImageTooBright|ImageTooBlurry —
-	// scene-change-class signals emitted by Hikvision (and some others)
-	// on firmwares without a TamperDetector rule. Treated as Tampering
-	// for the purpose of normalised event routing.
+	// tns1:VideoSource/GlobalSceneChange/ImagingService — Hikvision (and
+	// others) emit this on real lens-cover / scene substitution. This is
+	// the proper tamper signal on firmwares without TamperDetector.
 	// https://www.onvif.org/ver10/topics/topicns.xml
-	{"VideoSource/ImageTooDark", KindTampering},
-	{"VideoSource/ImageTooBright", KindTampering},
-	{"VideoSource/ImageTooBlurry", KindTampering},
+	{"GlobalSceneChange", KindTampering},
 
 	// tns1:VideoAnalytics/tnssamsung:TamperingDetection — Hanwha vendor.
 	// https://github.com/home-assistant/core/issues/66493
 	{"VideoAnalytics/TamperingDetection", KindTampering},
+
+	// ---------- Image quality -----------------------------------------
+
+	// tns1:VideoSource/ImageTooDark|ImageTooBright|ImageTooBlurry —
+	// imaging-quality alarms. Integrators (Milestone, Genetec, Frigate)
+	// route these separately from tamper because they fire on legitimate
+	// sunset/dawn/condensation transitions, not on actual interference.
+	// https://www.onvif.org/ver10/topics/topicns.xml
+	{"VideoSource/ImageTooDark", KindImageQuality},
+	{"VideoSource/ImageTooBright", KindImageQuality},
+	{"VideoSource/ImageTooBlurry", KindImageQuality},
 
 	// ---------- Digital I/O -------------------------------------------
 
 	// tns1:Device/Trigger/DigitalInput — standard ONVIF DeviceIO topic.
 	// Avigilon emits the per-segment-prefixed variant
 	// "tns1:Device/tns1:Trigger/tns1:DigitalInput"; canonicalization
-	// folds both to the same path. Data: LogicalState (xsd:boolean).
+	// folds both to the same path. Data: LogicalState (xsd:boolean),
+	// Source: InputToken.
 	// ONVIF-DeviceIo-Service-Spec.pdf §5.2
 	{"Trigger/DigitalInput", KindDigitalInput},
 
 	// tns1:Device/Trigger/Relay — standard ONVIF DeviceIO topic. Same
-	// canonicalisation note as DigitalInput. Data: LogicalState.
+	// canonicalisation note as DigitalInput. Data: LogicalState,
+	// Source: RelayToken.
 	// ONVIF-DeviceIo-Service-Spec.pdf §5.3
 	{"Trigger/Relay", KindDigitalOutput},
 
 	// ---------- Object analytics --------------------------------------
 
 	// tnsaxis:CameraApplicationPlatform/ObjectAnalytics/Device1Scenario<N>
-	// — AXIS Object Analytics. The Scenario<N> suffix is dynamic
-	// (Device1Scenario1, Device1ScenarioANY, ...) so we match the path
-	// prefix. Data: active ("0"/"1").
+	// — AXIS Object Analytics. Scenario suffixes are numeric per the
+	// AOA configuration (Device1Scenario1, Device1Scenario2, ...). Data:
+	// active ("0"/"1") plus classType / confidence when configured.
 	// https://developer.axis.com/analytics/axis-object-analytics/how-to-guides/axis-object-analytics-counting-data/
 	{"ObjectAnalytics/", KindObjectDetected},
 
 	// tns1:RuleEngine/LineDetector/Crossed — line crossing (Hikvision,
-	// Bosch IVA, others). Data: ObjectId (xsd:int).
+	// Bosch IVA, others). Data: ObjectId (xsd:int); edge-triggered, no
+	// State boolean.
 	// ONVIF-VideoAnalytics-Service-Spec-v220.pdf §5.4
 	{"LineDetector/Crossed", KindObjectDetected},
 
 	// tns1:RuleEngine/FieldDetector/ObjectsInside — intrusion / region
-	// detector (Hikvision, Bosch, Dahua).
+	// detector (Hikvision, Bosch, Dahua). Data: IsInside (xsd:boolean).
 	{"FieldDetector/ObjectsInside", KindObjectDetected},
 
 	// tns1:RuleEngine/MyRuleDetector/<RuleName> — vendor-defined rule
-	// names under the ONVIF "MyRuleDetector" container. Bosch IVA and
-	// Dahua SMD publish HumanDetect, VehicleDetect, ObjectsInside, etc.
-	// here. We match the container so future rule names are picked up
-	// automatically.
+	// names under the ONVIF MyRuleDetector container. We whitelist
+	// object-class rules emitted by Bosch IVA, Dahua SMD and Hikvision
+	// AcuSense so non-object rules under the same container (Bosch
+	// Counter, Occupancy) do not get mis-classified.
 	// https://media.boschsecurity.com/fs/media/pb/media/partners_1/integration_tools_1/developer/bosch-metadata-and-iva-events.pdf
-	{"MyRuleDetector/", KindObjectDetected},
-
-	// Fallback retained for legacy ObjectsInside callers that omit the
-	// MyRuleDetector container.
-	{"ObjectsInside", KindObjectDetected},
+	{"MyRuleDetector/HumanDetect", KindObjectDetected},
+	{"MyRuleDetector/VehicleDetect", KindObjectDetected},
+	{"MyRuleDetector/PeopleDetect", KindObjectDetected},
+	{"MyRuleDetector/ObjectsInside", KindObjectDetected},
+	{"MyRuleDetector/FaceDetect", KindObjectDetected},
 
 	// ---------- Audio --------------------------------------------------
 

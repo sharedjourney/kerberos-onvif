@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -138,7 +139,18 @@ func (o Options) withDefaults() Options {
 }
 
 // maxRecreateBackoff caps exponential backoff between recreate attempts.
-const maxRecreateBackoff = 30 * time.Second
+// Sized for fleet deployments: a 1000-camera setup recovering from a
+// switch reboot would otherwise hammer the network with one recreate
+// attempt per camera per 30s; 5 minutes gives the network time to
+// settle while still recovering promptly when a single camera comes
+// back.
+const maxRecreateBackoff = 5 * time.Minute
+
+// jitterFraction is the symmetric jitter applied to recreate backoff:
+// the actual sleep is sampled from [backoff*(1-jitter), backoff*(1+jitter)].
+// Prevents thundering-herd reconnects when many cameras drop together
+// (switch reboot, NAT timeout).
+const jitterFraction = 0.25
 
 // caller is the subset of *onvif.Device the Stream depends on. Tests
 // substitute a fake; production code uses the device adapter.
@@ -351,7 +363,7 @@ func (s *Stream) attemptRecreate(ctx context.Context, failures *int, backoff *ti
 	addr, err := createPullPoint(s.caller, s.opts)
 	if err != nil {
 		s.surfaceError(ErrRecreateFailed{Err: err})
-		if !sleepCtx(ctx, *backoff) {
+		if !sleepCtx(ctx, jitter(*backoff)) {
 			return false, false
 		}
 		*backoff *= 2
@@ -364,6 +376,23 @@ func (s *Stream) attemptRecreate(ctx context.Context, failures *int, backoff *ti
 	*failures = 0
 	*backoff = s.opts.RetryBackoff
 	return true, true
+}
+
+// jitter returns d perturbed by ±jitterFraction. Used to spread
+// recreate attempts across a fleet so a synchronised drop (switch
+// reboot, DHCP storm) does not cause a synchronised reconnect surge.
+// Returns at least 1ns to keep sleepCtx happy.
+func jitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return time.Nanosecond
+	}
+	spread := float64(d) * jitterFraction
+	delta := (rand.Float64()*2 - 1) * spread
+	out := time.Duration(float64(d) + delta)
+	if out <= 0 {
+		out = time.Nanosecond
+	}
+	return out
 }
 
 // renewLoop refreshes the subscription before InitialTermination expires.

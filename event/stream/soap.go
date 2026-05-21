@@ -16,16 +16,12 @@ import (
 	"github.com/kerberos-io/onvif/xsd"
 )
 
-// maxResponseBytes caps the size of a SOAP response we will buffer in
-// memory. ONVIF PullMessages bodies are normally <100KB even with dense
-// analytics payloads; 10 MiB is comfortably above legitimate traffic
-// while keeping a hostile or buggy camera from OOMing the process.
+// maxResponseBytes caps SOAP response buffering. ONVIF PullMessages
+// bodies are normally <100KB even with dense analytics payloads;
+// 10 MiB is comfortably above legitimate traffic while keeping a
+// hostile or buggy camera from OOMing the process.
 const maxResponseBytes = 10 << 20
 
-// createPullPoint issues a CreatePullPointSubscription against the
-// device service. Returns the SubscriptionReference Address, which is
-// the endpoint subsequent PullMessages / Renew / Unsubscribe calls
-// target.
 func createPullPoint(c caller, opts Options) (string, error) {
 	term := xsd.String(durationToXSD(opts.InitialTermination))
 	req := event.CreatePullPointSubscription{InitialTerminationTime: &term}
@@ -56,9 +52,8 @@ func createPullPoint(c caller, opts Options) (string, error) {
 	return addr, nil
 }
 
-// pullMessages issues PullMessages against an active subscription
-// endpoint and returns the decoded NotificationMessage list. Empty
-// slice (not error) when the camera had nothing within PullTimeout.
+// pullMessages returns an empty slice (no error) when the camera had
+// nothing within PullTimeout.
 func pullMessages(c caller, endpoint string, opts Options) ([]event.NotificationMessage, error) {
 	req := event.PullMessages{
 		Timeout:      xsd.Duration(durationToXSD(opts.PullTimeout)),
@@ -83,9 +78,8 @@ func pullMessages(c caller, endpoint string, opts Options) ([]event.Notification
 	return decoded.NotificationMessage, nil
 }
 
-// unsubscribePullPoint sends a best-effort Unsubscribe to release the
-// subscription server-side. Empty endpoint is a no-op (the construction
-// failed before installing one).
+// unsubscribePullPoint is best-effort. Empty endpoint is a no-op
+// (construction failed before installing one).
 func unsubscribePullPoint(c caller, endpoint string) error {
 	if endpoint == "" {
 		return nil
@@ -102,9 +96,6 @@ func unsubscribePullPoint(c caller, endpoint string) error {
 	return err
 }
 
-// readClose reads at most maxResponseBytes from resp.Body and closes
-// it. LimitReader prevents a hostile or buggy camera from OOMing the
-// agent by streaming an unbounded response.
 func readClose(resp *http.Response) (string, error) {
 	if resp == nil || resp.Body == nil {
 		return "", errors.New("nil HTTP response")
@@ -118,14 +109,13 @@ func readClose(resp *http.Response) (string, error) {
 }
 
 // unmarshalNode finds the first XML start element with the given local
-// name and decodes it into out. ONVIF SOAP responses come wrapped in an
-// envelope with multiple namespace prefixes; this helper sidesteps
-// namespace matching by keying on local name only.
+// name and decodes it into out. ONVIF SOAP responses are wrapped in an
+// envelope with many namespace prefixes; keying on local name only
+// sidesteps namespace matching.
 //
-// When the camera returns a SOAP Fault instead of the expected
-// response, the fault reason is surfaced as the error so callers can
-// distinguish "auth failed" / "subscription expired" from "unparseable
-// response".
+// When the camera returns a SOAP Fault, the fault reason is returned
+// as the error so callers can distinguish auth / expired-subscription
+// from "unparseable response".
 func unmarshalNode(body, localName string, out any) error {
 	if reason := extractSOAPFault(body); reason != "" {
 		return fmt.Errorf("ONVIF SOAP fault: %s", reason)
@@ -160,9 +150,9 @@ var (
 	soap12FaultRE = regexp.MustCompile(`(?s)<(?:[^:>\s]+:)?Reason\b[^>]*>.*?<(?:[^:>\s]+:)?Text[^>]*>(.*?)</(?:[^:>\s]+:)?Text>`)
 )
 
-// extractSOAPFault returns the human-readable reason text from a SOAP
-// fault, or empty string when the body is not a fault. Handles both
-// SOAP 1.1 (faultstring) and SOAP 1.2 (Reason/Text) shapes.
+// extractSOAPFault returns the reason text from a SOAP fault or empty
+// when the body is not a fault. Handles SOAP 1.1 (faultstring) and
+// SOAP 1.2 (Reason/Text) shapes.
 func extractSOAPFault(body string) string {
 	if !strings.Contains(body, "Fault") {
 		return ""
@@ -176,10 +166,9 @@ func extractSOAPFault(body string) string {
 	return ""
 }
 
-// durationToXSD formats a Go time.Duration as an xsd:duration string in
-// PTnS form. Second precision is sufficient — ONVIF cameras do not
-// honour sub-second pull timeouts and intermediate routers may round in
-// any case.
+// durationToXSD formats a duration as xsd:duration PTnS. Second
+// precision is sufficient — ONVIF cameras do not honour sub-second
+// pull timeouts.
 func durationToXSD(d time.Duration) string {
 	secs := int(d.Round(time.Second).Seconds())
 	if secs <= 0 {

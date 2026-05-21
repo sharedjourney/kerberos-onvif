@@ -2,24 +2,23 @@ package stream
 
 import "strings"
 
-// Classify maps an ONVIF topic string (e.g. "tns1:VideoSource/MotionAlarm")
-// to the normalized Kind that callers should switch on. Returns
+// Classify maps an ONVIF topic string to the normalized Kind. Returns
 // KindUnknown when no rule matches.
 //
-// The classifier strips XML-namespace prefixes (tns1:, tnsaxis:,
-// tnssamsung:, ...) from each "/"-separated segment of the topic so it is
-// robust to vendor namespace variants. Matching is case-sensitive because
-// ONVIF topic identifiers are case-sensitive per the spec.
+// The classifier strips XML-namespace prefixes from each "/"-separated
+// segment so it is robust to vendor namespaces (tns1:, tnsaxis:,
+// tnssamsung:, ...). Matching is case-sensitive — ONVIF topics are
+// case-sensitive per the spec.
 //
 // Sources cross-checked when building the rule set below:
 //   - ONVIF Topic Namespace XML
 //     https://www.onvif.org/onvif/ver10/topics/topicns.xml
-//   - ONVIF Analytics Service Spec (RuleEngine topics)
+//   - ONVIF Analytics Service Spec
 //     https://www.onvif.org/specs/srv/analytics/ONVIF-VideoAnalytics-Service-Spec-v220.pdf
-//   - ONVIF Device IO Service Spec (DigitalInput, Relay)
+//   - ONVIF Device IO Service Spec
 //     https://www.onvif.org/specs/srv/io/ONVIF-DeviceIo-Service-Spec.pdf
 //   - openvideolibs/onvif-parsers (Apache-2.0) — empirical topic table
-//     extracted from Home Assistant ONVIF integration
+//     extracted from Home Assistant
 //     https://github.com/openvideolibs/onvif-parsers
 func Classify(topic string) Kind {
 	if topic == "" {
@@ -34,15 +33,10 @@ func Classify(topic string) Kind {
 	return KindUnknown
 }
 
-// canonicalizeTopic strips the XML-namespace prefix (anything up to and
-// including the first ':') from each "/"-separated segment. This collapses
-// vendor variants like "tns1:Device/tns1:Trigger/tns1:Relay" (Avigilon
-// serialisation) and "tns1:Device/Trigger/Relay" (everyone else) to a
-// single matchable form.
-//
-// A segment that is only a prefix (e.g. "tns1:") canonicalizes to the
-// empty string. Multiple colons in one segment are not expected in real
-// ONVIF topics; the first colon wins.
+// canonicalizeTopic strips the XML-namespace prefix from each
+// "/"-separated segment, collapsing Avigilon's per-segment-prefixed
+// form ("tns1:Device/tns1:Trigger/tns1:Relay") and the plain form
+// ("tns1:Device/Trigger/Relay") to the same matchable path.
 func canonicalizeTopic(topic string) string {
 	segments := strings.Split(topic, "/")
 	for i, seg := range segments {
@@ -53,133 +47,88 @@ func canonicalizeTopic(topic string) string {
 	return strings.Join(segments, "/")
 }
 
-// topicRules is evaluated in order; first match wins. Keep more specific
-// rules ahead of broader ones — e.g. "ObjectAnalytics/" must precede any
-// future bare "Analytics" rule, and "MyRuleDetector/HumanDetect" must
-// precede a hypothetical broader "MyRuleDetector" entry. Each rule cites
-// the documentation that supports including it.
-//
-// Substring matching is intentional so vendor-specific path prefixes
-// outside the standard tns1: namespace (e.g.
-// tnsaxis:CameraApplicationPlatform/...) still match.
-//
-// Note on edge-triggered topics: tns1:RuleEngine/LineDetector/Crossed
-// carries an ObjectId rather than a State boolean. Consumers of Crossed
-// must not expect a level-triggered Active/Inactive semantic — the Stream
-// decoder will leave State as StateUnknown for these.
+// topicRules is evaluated in order — first match wins. Keep more
+// specific rules ahead of broader ones. LineDetector/Crossed is
+// edge-triggered (no boolean State); the decoder leaves State as
+// StateUnknown for it.
 var topicRules = []struct {
 	needle string
 	kind   Kind
 }{
-	// ---------- Motion -------------------------------------------------
-
-	// tns1:VideoSource/MotionAlarm — Profile S basic motion. Emitted by
-	// AXIS (basic VMD), Bosch, Dahua, Hikvision (newer firmware) and
-	// Hanwha as a fallback. Data SimpleItem: State (xsd:boolean).
+	// tns1:VideoSource/MotionAlarm — Profile S basic motion.
 	// https://www.onvif.org/ver10/topics/topicns.xml
 	// https://developer.axis.com/vapix/network-video/event-and-action-services/
 	{"VideoSource/MotionAlarm", KindMotion},
 
 	// tns1:VideoAnalytics/MotionAlarm — Bosch publishes motion under
-	// VideoAnalytics rather than VideoSource. Data: State.
+	// VideoAnalytics rather than VideoSource.
 	// https://media.boschsecurity.com/fs/media/pb/media/partners_1/integration_tools_1/developer/bosch-metadata-and-iva-events.pdf
 	{"VideoAnalytics/MotionAlarm", KindMotion},
 
-	// tns1:VideoAnalytics/tnssamsung:MotionDetection — Hanwha/Samsung
-	// Wisenet vendor-namespaced motion. Data: Motion ("0"/"1").
+	// tns1:VideoAnalytics/tnssamsung:MotionDetection — Hanwha vendor.
 	// https://github.com/home-assistant/core/issues/66493
 	{"VideoAnalytics/MotionDetection", KindMotion},
 
 	// tns1:RuleEngine/CellMotionDetector/Motion — ONVIF Analytics
-	// standard cell-motion rule. Emitted by AXIS (VMD3+), Hikvision,
-	// Avigilon analytics, others. Data: IsMotion (xsd:boolean).
+	// standard cell-motion rule.
 	// ONVIF-VideoAnalytics-Service-Spec-v220.pdf §5.3
 	// https://www.hikvisioneurope.com/eu/portal/portal/Technical%20Materials/24%20How%20To/CCTV/How%20to%20solve%20third%20party%20camera%20motion%20detection%20issue.pdf
 	{"CellMotionDetector/Motion", KindMotion},
 
-	// tns1:RuleEngine/MotionRegionDetector/Motion — AXIS-specific region
-	// motion rule. Data: IsMotion (xsd:boolean).
+	// tns1:RuleEngine/MotionRegionDetector/Motion — AXIS region rule.
 	// https://developer.axis.com/vapix/network-video/event-and-action-services/
 	{"MotionRegionDetector/Motion", KindMotion},
 
-	// AXIS Guard suite — vendor analytics apps that fire motion-like
-	// events with Camera<N>Profile<ID> suffixes. Treated as motion so
-	// they can drive motion-triggered recording on cameras configured
-	// with these apps instead of basic VMD.
+	// AXIS Guard suite — vendor analytics apps with Camera<N>Profile<ID>
+	// suffixes. Treated as motion so they can drive motion-triggered
+	// recording on cameras using these apps instead of basic VMD.
 	// https://developer.axis.com/vapix/applications/motion-guard
 	{"CameraApplicationPlatform/MotionGuard/", KindMotion},
 	{"CameraApplicationPlatform/FenceGuard/", KindMotion},
 	{"CameraApplicationPlatform/LoiteringGuard/", KindMotion},
 
-	// ---------- Tampering ---------------------------------------------
-
-	// tns1:RuleEngine/TamperDetector/Tamper — standard ONVIF tamper
-	// rule. Data: IsTamper (xsd:boolean). Anchored on the rule-name
-	// segment so "TamperDetectorLog" (hypothetical) does not match.
+	// tns1:RuleEngine/TamperDetector/Tamper — standard ONVIF tamper rule.
 	// ONVIF-VideoAnalytics-Service-Spec-v220.pdf §5.5
 	{"TamperDetector/Tamper", KindTampering},
 
-	// tns1:VideoSource/GlobalSceneChange/ImagingService — Hikvision (and
-	// others) emit this on real lens-cover / scene substitution. This is
-	// the proper tamper signal on firmwares without TamperDetector.
+	// tns1:VideoSource/GlobalSceneChange/ImagingService — the proper
+	// lens-cover signal on firmwares without TamperDetector.
 	// https://www.onvif.org/ver10/topics/topicns.xml
 	{"GlobalSceneChange", KindTampering},
 
-	// tns1:VideoAnalytics/tnssamsung:TamperingDetection — Hanwha vendor.
+	// tns1:VideoAnalytics/tnssamsung:TamperingDetection — Hanwha.
 	// https://github.com/home-assistant/core/issues/66493
 	{"VideoAnalytics/TamperingDetection", KindTampering},
 
-	// ---------- Image quality -----------------------------------------
-
-	// tns1:VideoSource/ImageTooDark|ImageTooBright|ImageTooBlurry —
-	// imaging-quality alarms. Integrators (Milestone, Genetec, Frigate)
-	// route these separately from tamper because they fire on legitimate
-	// sunset/dawn/condensation transitions, not on actual interference.
+	// VideoSource/ImageToo* — imaging-quality alarms. See KindImageQuality
+	// for the rationale on splitting these out from KindTampering.
 	// https://www.onvif.org/ver10/topics/topicns.xml
 	{"VideoSource/ImageTooDark", KindImageQuality},
 	{"VideoSource/ImageTooBright", KindImageQuality},
 	{"VideoSource/ImageTooBlurry", KindImageQuality},
 
-	// ---------- Digital I/O -------------------------------------------
-
-	// tns1:Device/Trigger/DigitalInput — standard ONVIF DeviceIO topic.
-	// Avigilon emits the per-segment-prefixed variant
-	// "tns1:Device/tns1:Trigger/tns1:DigitalInput"; canonicalization
-	// folds both to the same path. Data: LogicalState (xsd:boolean),
-	// Source: InputToken.
+	// tns1:Device/Trigger/DigitalInput — standard. Avigilon's per-segment-
+	// prefixed serialisation ("tns1:Device/tns1:Trigger/tns1:DigitalInput")
+	// folds to the same canonical path.
 	// ONVIF-DeviceIo-Service-Spec.pdf §5.2
 	{"Trigger/DigitalInput", KindDigitalInput},
-
-	// tns1:Device/Trigger/Relay — standard ONVIF DeviceIO topic. Same
-	// canonicalisation note as DigitalInput. Data: LogicalState,
-	// Source: RelayToken.
 	// ONVIF-DeviceIo-Service-Spec.pdf §5.3
 	{"Trigger/Relay", KindDigitalOutput},
 
-	// ---------- Object analytics --------------------------------------
-
 	// tnsaxis:CameraApplicationPlatform/ObjectAnalytics/Device1Scenario<N>
-	// — AXIS Object Analytics. Scenario suffixes are numeric per the
-	// AOA configuration (Device1Scenario1, Device1Scenario2, ...). Data:
-	// active ("0"/"1") plus classType / confidence when configured.
+	// — Scenario suffixes are numeric per AOA configuration. Prefix-match
+	// because of the dynamic suffix.
 	// https://developer.axis.com/analytics/axis-object-analytics/how-to-guides/axis-object-analytics-counting-data/
 	{"ObjectAnalytics/", KindObjectDetected},
 
-	// tns1:RuleEngine/LineDetector/Crossed — line crossing (Hikvision,
-	// Bosch IVA, others). Data: ObjectId (xsd:int); edge-triggered, no
-	// State boolean.
-	// https://www.onvif.org/specs/srv/analytics/ONVIF-VideoAnalytics-Service-Spec-v220.pdf §5.4
+	// ONVIF-VideoAnalytics-Service-Spec-v220.pdf §5.4
 	{"LineDetector/Crossed", KindObjectDetected},
-
-	// tns1:RuleEngine/FieldDetector/ObjectsInside — intrusion / region
-	// detector (Hikvision, Bosch, Dahua). Data: IsInside (xsd:boolean).
 	{"FieldDetector/ObjectsInside", KindObjectDetected},
 
-	// tns1:RuleEngine/MyRuleDetector/<RuleName> — vendor-defined rule
-	// names under the ONVIF MyRuleDetector container. We whitelist
-	// object-class rules emitted by Bosch IVA, Dahua SMD and Hikvision
-	// AcuSense so non-object rules under the same container (Bosch
-	// Counter, Occupancy) do not get mis-classified.
+	// tns1:RuleEngine/MyRuleDetector/<RuleName> — vendor rules under the
+	// ONVIF MyRuleDetector container. Explicitly whitelisted because the
+	// same container also carries non-object rules (Bosch Counter,
+	// Occupancy) that must not classify as ObjectDetected.
 	// https://media.boschsecurity.com/fs/media/pb/media/partners_1/integration_tools_1/developer/bosch-metadata-and-iva-events.pdf
 	{"MyRuleDetector/HumanDetect", KindObjectDetected},
 	{"MyRuleDetector/VehicleDetect", KindObjectDetected},
@@ -187,16 +136,8 @@ var topicRules = []struct {
 	{"MyRuleDetector/ObjectsInside", KindObjectDetected},
 	{"MyRuleDetector/FaceDetect", KindObjectDetected},
 
-	// ---------- Audio --------------------------------------------------
-
-	// tns1:AudioAnalytics/Audio/DetectedSound — standard ONVIF audio
-	// detection. Data: State (xsd:boolean).
 	{"Audio/DetectedSound", KindAudioAlarm},
-
-	// tns1:AudioSource/tnsaxis:TriggerLevel — AXIS audio level alarm.
 	// https://developer.axis.com/vapix/network-video/event-and-action-services/
 	{"AudioSource/TriggerLevel", KindAudioAlarm},
-
-	// tns1:AudioAnalytics/tnssamsung:SoundDetection — Hanwha vendor.
 	{"AudioAnalytics/SoundDetection", KindAudioAlarm},
 }

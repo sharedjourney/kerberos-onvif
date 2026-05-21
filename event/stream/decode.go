@@ -7,20 +7,9 @@ import (
 	"github.com/kerberos-io/onvif/event"
 )
 
-// decode converts a single ONVIF NotificationMessage into the package's
-// normalized Event representation. Unexported because the only intended
-// caller is the Stream; downstream consumers receive decoded Events on
-// the Events channel. Tests reach decode directly because they're in
-// the same package.
-//
-// deviceID is supplied by the caller because the message itself does not
-// identify the originating camera. observedAt is recorded verbatim as
-// Event.Timestamp; the camera-reported wsnt:UtcTime attribute (when
-// present and parseable) populates Event.DeviceTime.
-//
-// When the Topic does not match any classifier rule the returned Event
-// has Kind == KindUnknown but Source, Data and Topic are still populated
-// so consumers can fall back to inspecting the wire form.
+// decode converts a single ONVIF NotificationMessage into a normalized
+// Event. Topic, Source and Data are always populated even when Kind is
+// KindUnknown so consumers can fall back to the wire form.
 func decode(msg event.NotificationMessage, deviceID string, observedAt time.Time) Event {
 	topic := string(msg.Topic.TopicKinds)
 	desc := msg.Message.Message
@@ -37,9 +26,8 @@ func decode(msg event.NotificationMessage, deviceID string, observedAt time.Time
 	}
 }
 
-// simpleItemsToMap collapses ONVIF SimpleItem lists to a Name->Value map.
-// Returns nil for an empty list so empty notifications do not allocate
-// and match the Event zero-value contract.
+// simpleItemsToMap returns nil for an empty list so empty notifications
+// do not allocate.
 func simpleItemsToMap(items []event.SimpleItem) map[string]string {
 	if len(items) == 0 {
 		return nil
@@ -51,14 +39,9 @@ func simpleItemsToMap(items []event.SimpleItem) map[string]string {
 	return m
 }
 
-// extractState scans Data items for a boolean-like value and returns the
-// first one as a State. Returns StateUnknown when no item parses — this
-// is the correct outcome for edge-triggered topics such as
+// extractState scans Data items for a boolean-like value, returning the
+// first match. Returns StateUnknown for edge-triggered topics like
 // LineDetector/Crossed whose Data carries only an ObjectId.
-//
-// Iteration order over the original []SimpleItem is preserved so the
-// behaviour stays deterministic per notification. (Map iteration is not
-// involved; simpleItemsToMap is a separate path.)
 func extractState(items []event.SimpleItem) State {
 	for _, it := range items {
 		switch strings.ToLower(strings.TrimSpace(string(it.Value))) {
@@ -71,9 +54,8 @@ func extractState(items []event.SimpleItem) State {
 	return StateUnknown
 }
 
-// parsePropertyOperation parses the wsnt:PropertyOperation attribute.
-// The attribute is optional per WS-Notification; an empty or unrecognised
-// value yields PropertyUnknown.
+// parsePropertyOperation returns PropertyUnknown for absent (optional
+// per WS-Notification) or unrecognised values.
 func parsePropertyOperation(s string) PropertyOperation {
 	switch s {
 	case "Initialized":
@@ -87,15 +69,11 @@ func parsePropertyOperation(s string) PropertyOperation {
 	}
 }
 
-// parseDeviceTime parses the wsnt:UtcTime attribute, returning the zero
-// time when the attribute is absent or unparseable. The result is
-// normalised to UTC so equality comparisons across timezones work.
-//
-// xsd:dateTime in ONVIF messages is RFC 3339 in practice but real
-// cameras emit several flavours: with/without sub-seconds, with colon
-// or compact ("+0200") timezone offsets, and some older Hikvision
-// firmwares omit the timezone entirely (treated as UTC per
-// WS-BaseNotification which mandates UTC for UtcTime).
+// parseDeviceTime parses wsnt:UtcTime, returning the zero time when
+// absent or unparseable. Real cameras emit several flavours: with /
+// without sub-seconds, colon or compact ("+0200") offsets, and some
+// older Hikvision firmwares omit the timezone entirely (treated as
+// UTC per WS-BaseNotification which mandates UTC for UtcTime).
 func parseDeviceTime(s string) time.Time {
 	if s == "" {
 		return time.Time{}
@@ -108,14 +86,11 @@ func parseDeviceTime(s string) time.Time {
 	return time.Time{}
 }
 
-// deviceTimeLayouts lists the wsnt:UtcTime forms observed across vendor
-// firmwares. Ordered from most-precise / most-common first so the
-// happy path hits early.
 var deviceTimeLayouts = []string{
-	time.RFC3339Nano,               // 2026-05-21T10:30:00.500Z, ...+02:00
-	time.RFC3339,                   // 2026-05-21T10:30:00Z, ...+02:00
-	"2006-01-02T15:04:05.999-0700", // sub-second + compact offset (Geovision)
-	"2006-01-02T15:04:05-0700",     // compact offset (some Dahua)
-	"2006-01-02T15:04:05.999",      // no timezone, sub-second (rare)
-	"2006-01-02T15:04:05",          // naked, no TZ (older Hikvision)
+	time.RFC3339Nano,
+	time.RFC3339,
+	"2006-01-02T15:04:05.999-0700", // Geovision
+	"2006-01-02T15:04:05-0700",     // some Dahua
+	"2006-01-02T15:04:05.999",
+	"2006-01-02T15:04:05", // older Hikvision (no timezone)
 }

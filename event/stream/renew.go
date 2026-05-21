@@ -10,18 +10,15 @@ import (
 	"github.com/kerberos-io/onvif/xsd"
 )
 
-// renewLoop refreshes the subscription before InitialTermination expires.
-// Exits when ctx is cancelled. Renew failures surface as ErrRenewFailed
-// on the Errors channel; the loop continues because a permanently
-// failing renew will eventually drop the subscription and the pull
-// loop's reconnect path will recover (recreate is the only reliable
-// recovery once a subscription is GC'd at the camera).
+// renewLoop surfaces renew failures and continues. A permanently
+// failing renew lets the subscription die at the camera; the pull
+// loop's reconnect path then recreates it — recreate is the only
+// reliable recovery once a subscription is GC'd.
 func (s *Stream) renewLoop(ctx context.Context) {
 	interval := s.opts.InitialTermination - s.opts.RenewMargin
 	if interval <= 0 {
-		// Pathological config (margin >= termination): fall back to
-		// renewing at half the termination so we still refresh,
-		// rather than busy-looping or never renewing.
+		// Pathological config (margin >= termination): renew at
+		// half termination so we still refresh.
 		interval = s.opts.InitialTermination / 2
 		if interval <= 0 {
 			interval = time.Second
@@ -41,13 +38,10 @@ func (s *Stream) renewLoop(ctx context.Context) {
 	}
 }
 
-// renewPullPoint issues a wsnt:Renew SOAP against the given
-// subscription endpoint with an absolute TerminationTime.
-//
-// WS-BaseNotification §6.1.1 declares TerminationTime as xsd:dateTime
-// OR xsd:duration, but older Hikvision, some Dahua and some Bosch
-// firmwares reject the relative-duration form. We send an absolute
-// UTC datetime to match what production NVRs do.
+// renewPullPoint sends Renew with an absolute UTC TerminationTime.
+// WS-BaseNotification §6.1.1 also allows xsd:duration but older
+// Hikvision, some Dahua and some Bosch firmwares reject the
+// relative form.
 func renewPullPoint(c caller, endpoint string, opts Options) error {
 	absoluteEnd := time.Now().UTC().Add(opts.InitialTermination).Format("2006-01-02T15:04:05Z")
 	req := event.Renew{TerminationTime: xsd.String(absoluteEnd)}

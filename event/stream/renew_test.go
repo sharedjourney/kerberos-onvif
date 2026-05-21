@@ -132,3 +132,39 @@ func TestStream_RenewErrorSurfacedOnErrorsChannel(t *testing.T) {
 type errInjected struct{}
 
 func (errInjected) Error() string { return "injected fake error" }
+
+func TestRenew_SendsAbsoluteDateTimeNotDuration(t *testing.T) {
+	fc := newFakeCaller()
+	fc.queueCallMethod(createPullPointResp, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s, err := newStream(ctx, fc, Options{
+		InitialTermination: 30 * time.Millisecond,
+		RenewMargin:        5 * time.Millisecond,
+	})
+	require.NoError(t, err)
+	defer s.Close()
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if countSendSoapMatching(fc, "Renew") >= 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	var renewBody string
+	for _, c := range fc.sendSoapCalls {
+		if strings.Contains(c[1], "Renew") {
+			renewBody = c[1]
+			break
+		}
+	}
+	require.NotEmpty(t, renewBody, "no Renew call observed")
+	// Absolute form is "YYYY-MM-DDTHH:MM:SSZ" not "PTnS".
+	assert.NotContains(t, renewBody, "PT", "Renew should not send relative duration; some firmwares reject it")
+	assert.Regexp(t, `\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z`, renewBody, "Renew should send absolute RFC3339 UTC")
+}

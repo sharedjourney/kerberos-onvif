@@ -1,30 +1,14 @@
 package stream
 
 import (
-	"bytes"
 	"context"
-	"encoding/xml"
-	"errors"
 	"fmt"
-	"io"
-	"math/rand"
 	"net/http"
-	"regexp"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/kerberos-io/onvif"
-	"github.com/kerberos-io/onvif/event"
-	"github.com/kerberos-io/onvif/xsd"
 )
-
-// maxResponseBytes caps the size of a SOAP response we will buffer in
-// memory. ONVIF PullMessages bodies are normally <100KB even with dense
-// analytics payloads; 10 MiB is comfortably above legitimate traffic
-// while keeping a hostile or buggy camera from OOMing the process.
-const maxResponseBytes = 10 << 20
 
 // closeUnsubscribeTimeout bounds the SOAP Unsubscribe call issued by
 // Close so a hung camera connection cannot wedge the caller. The
@@ -137,20 +121,6 @@ func (o Options) withDefaults() Options {
 	d.DisableReconnect = o.DisableReconnect
 	return d
 }
-
-// maxRecreateBackoff caps exponential backoff between recreate attempts.
-// Sized for fleet deployments: a 1000-camera setup recovering from a
-// switch reboot would otherwise hammer the network with one recreate
-// attempt per camera per 30s; 5 minutes gives the network time to
-// settle while still recovering promptly when a single camera comes
-// back.
-const maxRecreateBackoff = 5 * time.Minute
-
-// jitterFraction is the symmetric jitter applied to recreate backoff:
-// the actual sleep is sampled from [backoff*(1-jitter), backoff*(1+jitter)].
-// Prevents thundering-herd reconnects when many cameras drop together
-// (switch reboot, NAT timeout).
-const jitterFraction = 0.25
 
 // caller is the subset of *onvif.Device the Stream depends on. Tests
 // substitute a fake; production code uses the device adapter.
@@ -282,6 +252,8 @@ func (s *Stream) Close() error {
 	return s.closeErr
 }
 
+// run orchestrates the pull and renew goroutines and closes the
+// emission channels once both have exited.
 func (s *Stream) run(ctx context.Context) {
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -300,130 +272,8 @@ func (s *Stream) run(ctx context.Context) {
 	close(s.done)
 }
 
-func (s *Stream) pullLoop(ctx context.Context) {
-	var failures int
-	recreateBackoff := s.opts.RetryBackoff
-	var afterReconnect bool
-
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-		msgs, err := pullMessages(s.caller, s.getPullPoint(), s.opts)
-		if err != nil {
-			s.surfaceError(ErrPullFailed{Err: err})
-			failures++
-			if !s.opts.DisableReconnect && failures >= s.opts.ReconnectAfterFailures {
-				justRecreated, cont := s.attemptRecreate(ctx, &failures, &recreateBackoff)
-				if !cont {
-					return
-				}
-				if justRecreated {
-					afterReconnect = true
-				}
-				continue
-			}
-			if !sleepCtx(ctx, s.opts.RetryBackoff) {
-				return
-			}
-			continue
-		}
-		// Successful pull resets failure tracking.
-		failures = 0
-		recreateBackoff = s.opts.RetryBackoff
-		observedAt := s.now()
-		for _, m := range msgs {
-			ev := decode(m, s.opts.DeviceID, observedAt)
-			if afterReconnect {
-				ev.AfterReconnect = true
-				// ONVIF replays current state with
-				// PropertyInitialized on a new subscription.
-				// Clear the flag as soon as we see anything
-				// other than Initialized — at that point we
-				// have transitioned to live events.
-				if ev.Operation != PropertyInitialized {
-					afterReconnect = false
-				}
-			}
-			select {
-			case <-ctx.Done():
-				return
-			case s.events <- ev:
-			}
-		}
-	}
-}
-
-// attemptRecreate calls CreatePullPointSubscription and on success
-// installs the new endpoint atomically. The first return is true when
-// recreate succeeded just now (caller flags the next batch with
-// AfterReconnect). The second return is false only if ctx was cancelled
-// during backoff (caller should exit the run loop).
-func (s *Stream) attemptRecreate(ctx context.Context, failures *int, backoff *time.Duration) (justRecreated, cont bool) {
-	addr, err := createPullPoint(s.caller, s.opts)
-	if err != nil {
-		s.surfaceError(ErrRecreateFailed{Err: err})
-		if !sleepCtx(ctx, jitter(*backoff)) {
-			return false, false
-		}
-		*backoff *= 2
-		if *backoff > maxRecreateBackoff {
-			*backoff = maxRecreateBackoff
-		}
-		return false, true
-	}
-	s.setPullPoint(addr)
-	*failures = 0
-	*backoff = s.opts.RetryBackoff
-	return true, true
-}
-
-// jitter returns d perturbed by ±jitterFraction. Used to spread
-// recreate attempts across a fleet so a synchronised drop (switch
-// reboot, DHCP storm) does not cause a synchronised reconnect surge.
-// Returns at least 1ns to keep sleepCtx happy.
-func jitter(d time.Duration) time.Duration {
-	if d <= 0 {
-		return time.Nanosecond
-	}
-	spread := float64(d) * jitterFraction
-	delta := (rand.Float64()*2 - 1) * spread
-	out := time.Duration(float64(d) + delta)
-	if out <= 0 {
-		out = time.Nanosecond
-	}
-	return out
-}
-
-// renewLoop refreshes the subscription before InitialTermination expires.
-// Exits when ctx is cancelled.
-func (s *Stream) renewLoop(ctx context.Context) {
-	interval := s.opts.InitialTermination - s.opts.RenewMargin
-	if interval <= 0 {
-		// Pathological config (margin >= termination): fall back to
-		// renewing at half the termination so we still refresh,
-		// rather than busy-looping or never renewing.
-		interval = s.opts.InitialTermination / 2
-		if interval <= 0 {
-			interval = time.Second
-		}
-	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if err := renewPullPoint(s.caller, s.getPullPoint(), s.opts); err != nil {
-				s.surfaceError(ErrRenewFailed{Err: err})
-			}
-		}
-	}
-}
-
 // surfaceError sends err on the errors channel non-blockingly so a
-// stalled consumer cannot block the pull loop.
+// stalled consumer cannot block the pull or renew loop.
 func (s *Stream) surfaceError(err error) {
 	select {
 	case s.errors <- err:
@@ -442,180 +292,4 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	case <-t.C:
 		return true
 	}
-}
-
-// --- SOAP helpers (unexported) ----------------------------------------
-
-func createPullPoint(c caller, opts Options) (string, error) {
-	term := xsd.String(durationToXSD(opts.InitialTermination))
-	req := event.CreatePullPointSubscription{InitialTerminationTime: &term}
-	if opts.RawTopicFilter != "" {
-		req.Filter = &event.FilterType{
-			TopicExpression: &event.TopicExpressionType{
-				Dialect:    xsd.String("http://www.onvif.org/ver10/tev/topicExpression/ConcreteSet"),
-				TopicKinds: xsd.String(opts.RawTopicFilter),
-			},
-		}
-	}
-	resp, err := c.CallMethod(req)
-	if err != nil {
-		return "", err
-	}
-	body, err := readClose(resp)
-	if err != nil {
-		return "", err
-	}
-	var decoded event.CreatePullPointSubscriptionResponse
-	if err := unmarshalNode(body, "CreatePullPointSubscriptionResponse", &decoded); err != nil {
-		return "", err
-	}
-	addr := string(decoded.SubscriptionReference.Address)
-	if addr == "" {
-		return "", errors.New("CreatePullPointSubscription response has empty SubscriptionReference Address")
-	}
-	return addr, nil
-}
-
-func pullMessages(c caller, endpoint string, opts Options) ([]event.NotificationMessage, error) {
-	req := event.PullMessages{
-		Timeout:      xsd.Duration(durationToXSD(opts.PullTimeout)),
-		MessageLimit: xsd.Int(opts.MessageLimit),
-	}
-	body, err := xml.Marshal(req)
-	if err != nil {
-		return nil, fmt.Errorf("marshal PullMessages: %w", err)
-	}
-	resp, err := c.SendSoap(endpoint, string(body))
-	if err != nil {
-		return nil, err
-	}
-	respBody, err := readClose(resp)
-	if err != nil {
-		return nil, err
-	}
-	var decoded event.PullMessagesResponse
-	if err := unmarshalNode(respBody, "PullMessagesResponse", &decoded); err != nil {
-		return nil, err
-	}
-	return decoded.NotificationMessage, nil
-}
-
-func renewPullPoint(c caller, endpoint string, opts Options) error {
-	// WS-BaseNotification §6.1.1 declares TerminationTime as
-	// xsd:dateTime OR xsd:duration, but older Hikvision, some Dahua
-	// and some Bosch firmwares reject the relative-duration form. Send
-	// an absolute UTC datetime to match what production NVRs do.
-	absoluteEnd := time.Now().UTC().Add(opts.InitialTermination).Format("2006-01-02T15:04:05Z")
-	req := event.Renew{TerminationTime: xsd.String(absoluteEnd)}
-	body, err := xml.Marshal(req)
-	if err != nil {
-		return fmt.Errorf("marshal Renew: %w", err)
-	}
-	resp, err := c.SendSoap(endpoint, string(body))
-	if err != nil {
-		return err
-	}
-	_, err = readClose(resp)
-	return err
-}
-
-func unsubscribePullPoint(c caller, endpoint string) error {
-	if endpoint == "" {
-		return nil
-	}
-	body, err := xml.Marshal(event.Unsubscribe{})
-	if err != nil {
-		return fmt.Errorf("marshal Unsubscribe: %w", err)
-	}
-	resp, err := c.SendSoap(endpoint, string(body))
-	if err != nil {
-		return err
-	}
-	_, err = readClose(resp)
-	return err
-}
-
-func readClose(resp *http.Response) (string, error) {
-	if resp == nil || resp.Body == nil {
-		return "", errors.New("nil HTTP response")
-	}
-	defer resp.Body.Close()
-	// LimitReader prevents a hostile or buggy camera from OOMing the
-	// agent by streaming an unbounded response body.
-	b, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
-	if err != nil {
-		return "", fmt.Errorf("read response body: %w", err)
-	}
-	return string(b), nil
-}
-
-// unmarshalNode finds the first XML start element with the given local
-// name and decodes it into out. ONVIF SOAP responses come wrapped in an
-// envelope with multiple namespace prefixes; this helper sidesteps
-// namespace matching by keying on local name only.
-//
-// When the camera returns a SOAP Fault instead of the expected
-// response, the fault reason is surfaced as the error so callers can
-// distinguish "auth failed" / "subscription expired" from "unparseable
-// response".
-func unmarshalNode(body, localName string, out any) error {
-	if reason := extractSOAPFault(body); reason != "" {
-		return fmt.Errorf("ONVIF SOAP fault: %s", reason)
-	}
-	dec := xml.NewDecoder(bytes.NewBufferString(body))
-	for {
-		tok, err := dec.Token()
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return fmt.Errorf("ONVIF response missing %s element", localName)
-			}
-			return fmt.Errorf("scan ONVIF response: %w", err)
-		}
-		start, ok := tok.(xml.StartElement)
-		if !ok {
-			continue
-		}
-		if start.Name.Local != localName {
-			continue
-		}
-		if err := dec.DecodeElement(out, &start); err != nil {
-			return fmt.Errorf("decode %s: %w", localName, err)
-		}
-		return nil
-	}
-}
-
-var (
-	// SOAP 1.1: <faultstring>reason</faultstring>
-	soap11FaultRE = regexp.MustCompile(`(?s)<(?:[^:>\s]+:)?faultstring[^>]*>(.*?)</(?:[^:>\s]+:)?faultstring>`)
-	// SOAP 1.2: <Fault>...<Reason><Text>reason</Text></Reason>...</Fault>
-	soap12FaultRE = regexp.MustCompile(`(?s)<(?:[^:>\s]+:)?Reason\b[^>]*>.*?<(?:[^:>\s]+:)?Text[^>]*>(.*?)</(?:[^:>\s]+:)?Text>`)
-)
-
-// extractSOAPFault returns the human-readable reason text from a SOAP
-// fault, or empty string when the body is not a fault. Handles both
-// SOAP 1.1 (faultstring) and SOAP 1.2 (Reason/Text) shapes.
-func extractSOAPFault(body string) string {
-	if !strings.Contains(body, "Fault") {
-		return ""
-	}
-	if m := soap11FaultRE.FindStringSubmatch(body); len(m) > 1 {
-		return strings.TrimSpace(m[1])
-	}
-	if m := soap12FaultRE.FindStringSubmatch(body); len(m) > 1 {
-		return strings.TrimSpace(m[1])
-	}
-	return ""
-}
-
-// durationToXSD formats a Go time.Duration as an xsd:duration string in
-// PTnS form. Second precision is sufficient — ONVIF cameras do not
-// honour sub-second pull timeouts and intermediate routers may round in
-// any case.
-func durationToXSD(d time.Duration) string {
-	secs := int(d.Round(time.Second).Seconds())
-	if secs <= 0 {
-		secs = 1
-	}
-	return "PT" + strconv.Itoa(secs) + "S"
 }

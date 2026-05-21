@@ -1,6 +1,7 @@
 package stream
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -113,4 +114,30 @@ func TestEventFieldAssignmentRoundTrip(t *testing.T) {
 	assert.Equal(t, "tns1:Device/Trigger/DigitalInput", e.Topic)
 	assert.True(t, e.Timestamp.Equal(now))
 	assert.True(t, e.DeviceTime.Equal(deviceTime))
+}
+
+// --- Typed errors -----------------------------------------------------
+
+func TestTypedErrors_UnwrapAndOp(t *testing.T) {
+	inner := errors.New("boom")
+	tests := []struct {
+		name string
+		err  error
+		op   Op
+	}{
+		{"pull", ErrPullFailed{Err: inner}, OpPull},
+		{"renew", ErrRenewFailed{Err: inner}, OpRenew},
+		{"recreate", ErrRecreateFailed{Err: inner}, OpRecreate},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.True(t, errors.Is(tc.err, inner), "errors.Is should unwrap to inner")
+			assert.Contains(t, tc.err.Error(), "boom")
+			if e, ok := tc.err.(interface{ Op() Op }); ok {
+				assert.Equal(t, tc.op, e.Op())
+			} else {
+				t.Fatalf("%T does not expose Op()", tc.err)
+			}
+		})
+	}
 }

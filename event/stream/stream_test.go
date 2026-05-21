@@ -351,3 +351,96 @@ func TestStream_DoesNotPanicOnPullExitingDuringClose(t *testing.T) {
 		_ = s.Close()
 	})
 }
+
+// --- Close error / timeout paths -------------------------------------
+
+func TestClose_ReturnsUnsubscribeError(t *testing.T) {
+	fc := newFakeCaller()
+	fc.queueCallMethod(createPullPointResp, nil)
+	fc.mu.Lock()
+	fc.defaultSendSoap = fakeResp{err: errors.New("simulated transport failure")}
+	fc.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s, err := newStream(ctx, fc, Options{InitialTermination: 30 * time.Second})
+	require.NoError(t, err)
+
+	err = s.Close()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unsubscribe pull point")
+	assert.Contains(t, err.Error(), "simulated transport failure")
+}
+
+func TestClose_BoundedByTimeoutOnHungUnsubscribe(t *testing.T) {
+	fc := newFakeCaller()
+	fc.queueCallMethod(createPullPointResp, nil)
+	block := make(chan struct{})
+	defer close(block) // release the hung Unsubscribe so the fake's goroutine exits
+	fc.mu.Lock()
+	fc.blockUnsubscribe = block
+	fc.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s, err := newStream(ctx, fc, Options{InitialTermination: 30 * time.Second})
+	require.NoError(t, err)
+
+	start := time.Now()
+	err = s.Close()
+	elapsed := time.Since(start)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "timeout")
+	assert.Less(t, elapsed, closeUnsubscribeTimeout+time.Second,
+		"Close exceeded bound (%s); expected ~%s", elapsed, closeUnsubscribeTimeout)
+}
+
+// --- NewStream edge cases --------------------------------------------
+
+func TestNewStream_CtxAlreadyCancelled(t *testing.T) {
+	fc := newFakeCaller()
+	fc.queueCallMethod(createPullPointResp, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel before NewStream
+
+	s, err := newStream(ctx, fc, Options{InitialTermination: 30 * time.Second})
+	require.NoError(t, err)
+	require.NotNil(t, s)
+
+	select {
+	case _, ok := <-s.Events():
+		assert.False(t, ok, "events channel should be closed when ctx is pre-cancelled")
+	case <-time.After(time.Second):
+		t.Fatal("events channel was not closed within 1s")
+	}
+	_ = s.Close()
+}
+
+// --- fakeCaller self-test --------------------------------------------
+
+func TestFakeCaller_QueueThenDefaultFallback(t *testing.T) {
+	fc := newFakeCaller()
+	fc.queueSendSoap("first", nil)
+	fc.queueSendSoap("second", nil)
+
+	r1, err := fc.SendSoap("ep", "body")
+	require.NoError(t, err)
+	b1 := make([]byte, 10)
+	n, _ := r1.Body.Read(b1)
+	assert.Equal(t, "first", string(b1[:n]))
+
+	r2, _ := fc.SendSoap("ep", "body")
+	b2 := make([]byte, 10)
+	n, _ = r2.Body.Read(b2)
+	assert.Equal(t, "second", string(b2[:n]))
+
+	// Queue is exhausted; default kicks in.
+	r3, err := fc.SendSoap("ep", "body")
+	require.NoError(t, err)
+	require.NotNil(t, r3)
+	b3 := make([]byte, 2048)
+	n, _ = r3.Body.Read(b3)
+	assert.Contains(t, string(b3[:n]), "PullMessagesResponse",
+		"default SendSoap should be an empty PullMessagesResponse envelope")
+}

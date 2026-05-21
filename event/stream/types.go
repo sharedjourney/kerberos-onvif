@@ -159,4 +159,13 @@ type Event struct {
 	// Timestamp for ordering and DeviceTime only for forensics or
 	// cross-camera correlation when caller manages NTP.
 	DeviceTime time.Time
+	// AfterReconnect is true for events delivered after the Stream
+	// silently recreated its pull-point subscription. ONVIF cameras
+	// replay each property's current value with PropertyInitialized on
+	// a new subscription, which would otherwise look like a flood of
+	// new state changes to a consumer doing edge-detection. Watch this
+	// flag to suppress duplicate handling, or treat it as a normal
+	// event if you only care about steady-state level. Cleared on the
+	// first event whose Operation is not PropertyInitialized.
+	AfterReconnect bool
 }

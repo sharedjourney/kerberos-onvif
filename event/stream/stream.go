@@ -270,6 +270,7 @@ func (s *Stream) run(ctx context.Context) {
 func (s *Stream) pullLoop(ctx context.Context) {
 	var failures int
 	recreateBackoff := s.opts.RetryBackoff
+	var afterReconnect bool
 
 	for {
 		if ctx.Err() != nil {
@@ -277,11 +278,15 @@ func (s *Stream) pullLoop(ctx context.Context) {
 		}
 		msgs, err := pullMessages(s.caller, s.getPullPoint(), s.opts)
 		if err != nil {
-			s.surfaceError(err)
+			s.surfaceError(ErrPullFailed{Err: err})
 			failures++
 			if failures >= s.opts.ReconnectAfterFailures {
-				if !s.attemptRecreate(ctx, &failures, &recreateBackoff) {
+				justRecreated, cont := s.attemptRecreate(ctx, &failures, &recreateBackoff)
+				if !cont {
 					return
+				}
+				if justRecreated {
+					afterReconnect = true
 				}
 				continue
 			}
@@ -296,6 +301,17 @@ func (s *Stream) pullLoop(ctx context.Context) {
 		observedAt := s.now()
 		for _, m := range msgs {
 			ev := Decode(m, s.opts.DeviceID, observedAt)
+			if afterReconnect {
+				ev.AfterReconnect = true
+				// ONVIF replays current state with
+				// PropertyInitialized on a new subscription.
+				// Clear the flag as soon as we see anything
+				// other than Initialized — at that point we
+				// have transitioned to live events.
+				if ev.Operation != PropertyInitialized {
+					afterReconnect = false
+				}
+			}
 			select {
 			case <-ctx.Done():
 				return
@@ -306,26 +322,27 @@ func (s *Stream) pullLoop(ctx context.Context) {
 }
 
 // attemptRecreate calls CreatePullPointSubscription and on success
-// installs the new endpoint atomically. Returns false if ctx was
-// cancelled while waiting for backoff (caller should exit the run
-// loop).
-func (s *Stream) attemptRecreate(ctx context.Context, failures *int, backoff *time.Duration) bool {
+// installs the new endpoint atomically. The first return is true when
+// recreate succeeded just now (caller flags the next batch with
+// AfterReconnect). The second return is false only if ctx was cancelled
+// during backoff (caller should exit the run loop).
+func (s *Stream) attemptRecreate(ctx context.Context, failures *int, backoff *time.Duration) (justRecreated, cont bool) {
 	addr, err := createPullPoint(s.caller, s.opts)
 	if err != nil {
-		s.surfaceError(fmt.Errorf("recreate pull point: %w", err))
+		s.surfaceError(ErrRecreateFailed{Err: err})
 		if !sleepCtx(ctx, *backoff) {
-			return false
+			return false, false
 		}
 		*backoff *= 2
 		if *backoff > maxRecreateBackoff {
 			*backoff = maxRecreateBackoff
 		}
-		return true
+		return false, true
 	}
 	s.setPullPoint(addr)
 	*failures = 0
 	*backoff = s.opts.RetryBackoff
-	return true
+	return true, true
 }
 
 // renewLoop refreshes the subscription before InitialTermination expires.
@@ -349,7 +366,7 @@ func (s *Stream) renewLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			if err := renewPullPoint(s.caller, s.getPullPoint(), s.opts); err != nil {
-				s.surfaceError(fmt.Errorf("renew pull point: %w", err))
+				s.surfaceError(ErrRenewFailed{Err: err})
 			}
 		}
 	}

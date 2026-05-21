@@ -88,17 +88,31 @@ func parsePropertyOperation(s string) PropertyOperation {
 // time when the attribute is absent or unparseable. The result is
 // normalised to UTC so equality comparisons across timezones work.
 //
-// xsd:dateTime in ONVIF messages is RFC 3339 in practice; we try
-// time.RFC3339Nano first (covers sub-second precision) and fall back to
-// time.RFC3339 for cameras that drop the fractional part.
+// xsd:dateTime in ONVIF messages is RFC 3339 in practice but real
+// cameras emit several flavours: with/without sub-seconds, with colon
+// or compact ("+0200") timezone offsets, and some older Hikvision
+// firmwares omit the timezone entirely (treated as UTC per
+// WS-BaseNotification which mandates UTC for UtcTime).
 func parseDeviceTime(s string) time.Time {
 	if s == "" {
 		return time.Time{}
 	}
-	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
+	for _, layout := range deviceTimeLayouts {
 		if t, err := time.Parse(layout, s); err == nil {
 			return t.UTC()
 		}
 	}
 	return time.Time{}
+}
+
+// deviceTimeLayouts lists the wsnt:UtcTime forms observed across vendor
+// firmwares. Ordered from most-precise / most-common first so the
+// happy path hits early.
+var deviceTimeLayouts = []string{
+	time.RFC3339Nano,            // 2026-05-21T10:30:00.500Z, ...+02:00
+	time.RFC3339,                // 2026-05-21T10:30:00Z, ...+02:00
+	"2006-01-02T15:04:05.999-0700", // sub-second + compact offset (Geovision)
+	"2006-01-02T15:04:05-0700",     // compact offset (some Dahua)
+	"2006-01-02T15:04:05.999",      // no timezone, sub-second (rare)
+	"2006-01-02T15:04:05",          // naked, no TZ (older Hikvision)
 }

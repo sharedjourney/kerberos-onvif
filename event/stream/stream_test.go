@@ -20,14 +20,19 @@ import (
 // returns the next queued response; when the queue is exhausted it falls
 // back to a default response so the indefinite pull loop does not
 // require tests to enumerate every call.
+//
+// blockUnsubscribe, when non-nil, causes SendSoap calls whose body
+// contains "Unsubscribe" to block until the channel is closed. Used to
+// verify Close's timeout path.
 type fakeCaller struct {
-	mu              sync.Mutex
-	callMethodResps []fakeResp
-	sendSoapResps   []fakeResp
-	defaultSendSoap fakeResp
-	defaultCall     fakeResp
-	callMethodCalls []any
-	sendSoapCalls   [][2]string
+	mu               sync.Mutex
+	callMethodResps  []fakeResp
+	sendSoapResps    []fakeResp
+	defaultSendSoap  fakeResp
+	defaultCall      fakeResp
+	callMethodCalls  []any
+	sendSoapCalls    [][2]string
+	blockUnsubscribe chan struct{}
 }
 
 type fakeResp struct {
@@ -72,13 +77,19 @@ func (f *fakeCaller) CallMethod(m any) (*http.Response, error) {
 
 func (f *fakeCaller) SendSoap(endpoint, body string) (*http.Response, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.sendSoapCalls = append(f.sendSoapCalls, [2]string{endpoint, body})
 	r := f.defaultSendSoap
 	if len(f.sendSoapResps) > 0 {
 		r = f.sendSoapResps[0]
 		f.sendSoapResps = f.sendSoapResps[1:]
 	}
+	block := f.blockUnsubscribe
+	f.mu.Unlock()
+
+	if block != nil && strings.Contains(body, "Unsubscribe") {
+		<-block
+	}
+
 	if r.err != nil {
 		return nil, r.err
 	}

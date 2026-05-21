@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,6 +18,18 @@ import (
 	"github.com/kerberos-io/onvif/event"
 	"github.com/kerberos-io/onvif/xsd"
 )
+
+// maxResponseBytes caps the size of a SOAP response we will buffer in
+// memory. ONVIF PullMessages bodies are normally <100KB even with dense
+// analytics payloads; 10 MiB is comfortably above legitimate traffic
+// while keeping a hostile or buggy camera from OOMing the process.
+const maxResponseBytes = 10 << 20
+
+// closeUnsubscribeTimeout bounds the SOAP Unsubscribe call issued by
+// Close so a hung camera connection cannot wedge the caller. The
+// subscription expires at the camera anyway once InitialTermination
+// elapses, so a missed unsubscribe is at worst cosmetic.
+const closeUnsubscribeTimeout = 5 * time.Second
 
 // Options configures a Stream. The zero value is usable; defaultOptions
 // fills in production-sensible defaults for any unset field.
@@ -107,6 +121,11 @@ const maxRecreateBackoff = 30 * time.Second
 
 // caller is the subset of *onvif.Device the Stream depends on. Tests
 // substitute a fake; production code uses the device adapter.
+//
+// Implementations must be safe for concurrent use: the pull loop and
+// renew loop call into caller from separate goroutines. *onvif.Device
+// satisfies this because its HTTP client is the goroutine-safe
+// http.Client.
 type caller interface {
 	CallMethod(method any) (*http.Response, error)
 	SendSoap(endpoint, body string) (*http.Response, error)
@@ -204,25 +223,33 @@ func (s *Stream) Errors() <-chan error { return s.errors }
 
 // Close stops the background goroutine, waits for it to exit, and
 // unsubscribes from the camera. Subsequent calls are no-ops.
+//
+// Unsubscribe is bounded by closeUnsubscribeTimeout so a hung camera
+// connection cannot wedge the caller. On timeout Close still returns
+// promptly; the subscription will expire at the camera once
+// InitialTermination + RenewMargin elapses without a renew.
 func (s *Stream) Close() error {
 	s.closeOnce.Do(func() {
 		s.cancel()
 		<-s.done
-		// Unsubscribe is best-effort: if the camera is unreachable
-		// the subscription will expire on its own at
-		// InitialTermination + Renew interval anyway.
-		if err := unsubscribePullPoint(s.caller, s.getPullPoint()); err != nil {
-			s.closeErr = fmt.Errorf("unsubscribe pull point: %w", err)
+
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- unsubscribePullPoint(s.caller, s.getPullPoint())
+		}()
+		select {
+		case err := <-errCh:
+			if err != nil {
+				s.closeErr = fmt.Errorf("unsubscribe pull point: %w", err)
+			}
+		case <-time.After(closeUnsubscribeTimeout):
+			s.closeErr = fmt.Errorf("unsubscribe pull point: timeout after %s", closeUnsubscribeTimeout)
 		}
 	})
 	return s.closeErr
 }
 
 func (s *Stream) run(ctx context.Context) {
-	defer close(s.done)
-	defer close(s.events)
-	defer close(s.errors)
-
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
@@ -231,6 +258,13 @@ func (s *Stream) run(ctx context.Context) {
 	}()
 	s.pullLoop(ctx)
 	wg.Wait()
+
+	// Explicit close order after both goroutines have exited so a
+	// future maintainer extending this function does not accidentally
+	// rely on defer-ordering for channel-close safety.
+	close(s.errors)
+	close(s.events)
+	close(s.done)
 }
 
 func (s *Stream) pullLoop(ctx context.Context) {
@@ -400,7 +434,12 @@ func pullMessages(c caller, endpoint string, opts Options) ([]event.Notification
 }
 
 func renewPullPoint(c caller, endpoint string, opts Options) error {
-	req := event.Renew{TerminationTime: xsd.String(durationToXSD(opts.InitialTermination))}
+	// WS-BaseNotification §6.1.1 declares TerminationTime as
+	// xsd:dateTime OR xsd:duration, but older Hikvision, some Dahua
+	// and some Bosch firmwares reject the relative-duration form. Send
+	// an absolute UTC datetime to match what production NVRs do.
+	absoluteEnd := time.Now().UTC().Add(opts.InitialTermination).Format("2006-01-02T15:04:05Z")
+	req := event.Renew{TerminationTime: xsd.String(absoluteEnd)}
 	body, err := xml.Marshal(req)
 	if err != nil {
 		return fmt.Errorf("marshal Renew: %w", err)
@@ -434,7 +473,9 @@ func readClose(resp *http.Response) (string, error) {
 		return "", errors.New("nil HTTP response")
 	}
 	defer resp.Body.Close()
-	b, err := io.ReadAll(resp.Body)
+	// LimitReader prevents a hostile or buggy camera from OOMing the
+	// agent by streaming an unbounded response body.
+	b, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
 		return "", fmt.Errorf("read response body: %w", err)
 	}
@@ -445,7 +486,15 @@ func readClose(resp *http.Response) (string, error) {
 // name and decodes it into out. ONVIF SOAP responses come wrapped in an
 // envelope with multiple namespace prefixes; this helper sidesteps
 // namespace matching by keying on local name only.
+//
+// When the camera returns a SOAP Fault instead of the expected
+// response, the fault reason is surfaced as the error so callers can
+// distinguish "auth failed" / "subscription expired" from "unparseable
+// response".
 func unmarshalNode(body, localName string, out any) error {
+	if reason := extractSOAPFault(body); reason != "" {
+		return fmt.Errorf("ONVIF SOAP fault: %s", reason)
+	}
 	dec := xml.NewDecoder(bytes.NewBufferString(body))
 	for {
 		tok, err := dec.Token()
@@ -467,6 +516,29 @@ func unmarshalNode(body, localName string, out any) error {
 		}
 		return nil
 	}
+}
+
+var (
+	// SOAP 1.1: <faultstring>reason</faultstring>
+	soap11FaultRE = regexp.MustCompile(`(?s)<(?:[^:>\s]+:)?faultstring[^>]*>(.*?)</(?:[^:>\s]+:)?faultstring>`)
+	// SOAP 1.2: <Fault>...<Reason><Text>reason</Text></Reason>...</Fault>
+	soap12FaultRE = regexp.MustCompile(`(?s)<(?:[^:>\s]+:)?Reason\b[^>]*>.*?<(?:[^:>\s]+:)?Text[^>]*>(.*?)</(?:[^:>\s]+:)?Text>`)
+)
+
+// extractSOAPFault returns the human-readable reason text from a SOAP
+// fault, or empty string when the body is not a fault. Handles both
+// SOAP 1.1 (faultstring) and SOAP 1.2 (Reason/Text) shapes.
+func extractSOAPFault(body string) string {
+	if !strings.Contains(body, "Fault") {
+		return ""
+	}
+	if m := soap11FaultRE.FindStringSubmatch(body); len(m) > 1 {
+		return strings.TrimSpace(m[1])
+	}
+	if m := soap12FaultRE.FindStringSubmatch(body); len(m) > 1 {
+		return strings.TrimSpace(m[1])
+	}
+	return ""
 }
 
 // durationToXSD formats a Go time.Duration as an xsd:duration string in

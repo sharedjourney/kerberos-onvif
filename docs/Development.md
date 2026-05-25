@@ -32,3 +32,23 @@ python3 python/gen_commands.py
 
 > **Note:** You can also typically run the generator within your IDE thanks to the `//go:generate` lines 
 > towards the top of the `types.go` files.
+
+## Higher-level helpers
+
+Some web service directories ship hand-written, higher-level helpers
+built on top of the wire-layer commands. These are normal Go packages
+— **not** covered by the `gen_commands.py` workflow above and not
+expected to be regenerated.
+
+- [event/stream](../event/stream) — channel-based event consumer that
+  owns the pull-point subscription lifecycle (Create, Pull, Renew,
+  Unsubscribe, reconnect with jittered backoff) and decodes
+  notifications into normalized typed Events. Vendor topic strings
+  (AXIS, Hikvision, Avigilon, Hanwha, Bosch, Dahua) are classified
+  into a small set of `Kind` values. See the package `doc.go` for the
+  public surface and usage.
+- [event/topic](../event/topic) — topic identifier helpers.
+
+When adding a similar higher-level helper, place it under the relevant
+web service directory as a sub-package so consumers find it next to
+the wire-layer types it builds on.

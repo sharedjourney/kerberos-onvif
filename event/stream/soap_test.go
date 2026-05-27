@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -391,4 +392,212 @@ func TestUnsubscribePullPoint_EmptyAddressIsNoOp(t *testing.T) {
 	fc := newFakeCaller()
 	require.NoError(t, unsubscribePullPoint(fc, subscriptionRef{}))
 	assert.Empty(t, fc.sendSoapCalls, "no SOAP call should happen when there is no subscription endpoint")
+}
+
+// End-to-end multi-child wiring through the production caller, not
+// just the unit-tested builder. Without the fix to addHeaderChildren
+// in Device.SendSoapWithHeader, the second child would silently
+// vanish from the wire envelope.
+func TestPullMessages_TwoRefParamsEachLandsOnTheWire(t *testing.T) {
+	ref := subscriptionRef{
+		Address: "http://camera/sub",
+		RefParamsXML: `<a:Foo xmlns:a="ns/a">1</a:Foo>` +
+			`<b:Bar xmlns:b="ns/b">2</b:Bar>`,
+	}
+	fc := newFakeCaller()
+	_, err := pullMessages(fc, ref, defaultOptions())
+	require.NoError(t, err)
+	require.Len(t, fc.sendSoapHeaders, 1)
+	hdr := fc.sendSoapHeaders[0]
+	assert.Equal(t, 2, strings.Count(hdr, `IsReferenceParameter="true"`))
+	assert.Contains(t, hdr, "Foo")
+	assert.Contains(t, hdr, "Bar")
+}
+
+// A camera echoing our request in a fault response (some debug-mode
+// firmwares do) or a fault that includes the Security header verbatim
+// would otherwise leak the WS-Security Username/Password into operator
+// logs. The body excerpt must scrub the Security block before the
+// fault extractor and the excerpt fallback see it.
+func TestEnrichSOAPErr_RedactsWSSESecurityBlock(t *testing.T) {
+	body := `<env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope">
+  <env:Header><wsse:Security xmlns:wsse="x"><wsse:UsernameToken>
+    <wsse:Username>admin</wsse:Username>
+    <wsse:Password>hunter2</wsse:Password>
+  </wsse:UsernameToken></wsse:Security></env:Header>
+  <env:Body>plain text excerpt</env:Body>
+</env:Envelope>`
+	got := enrichSOAPErr(fakeResponse(body), errors.New("400"))
+	require.Error(t, got)
+	assert.NotContains(t, got.Error(), "hunter2", "Password must never reach logs")
+	assert.NotContains(t, got.Error(), "admin", "Username must never reach logs")
+	assert.Contains(t, got.Error(), "REDACTED", "redaction marker must remain visible")
+}
+
+// Same vendor pattern as the enrichSOAPErr case but reached via
+// unmarshalNode → extractSOAPFault on a 200 OK response carrying a
+// Fault. Diverging from enrichSOAPErr's fallback chain would mean
+// PullMessages reports "missing PullMessagesResponse element" instead
+// of the actionable ter:InvalidArgs.
+func TestExtractSOAPFault_FallsBackToSubcodeWhenReasonEmpty(t *testing.T) {
+	body := `<env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope">
+  <env:Body><env:Fault>
+    <env:Code>
+      <env:Value>env:Sender</env:Value>
+      <env:Subcode><env:Value>ter:InvalidArgs</env:Value></env:Subcode>
+    </env:Code>
+    <env:Reason><env:Text xml:lang="en"/></env:Reason>
+  </env:Fault></env:Body>
+</env:Envelope>`
+	assert.Equal(t, "ter:InvalidArgs", extractSOAPFault(body))
+}
+
+// WS-Addressing §3.1 allows ReferenceParameters in any endpoint
+// reference (wsa:From, wsa:ReplyTo, wsa:FaultTo, ...). An unanchored
+// search would silently pick up the wrong one.
+func TestExtractReferenceParameters_AnchoredToSubscriptionReference(t *testing.T) {
+	body := `<env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope"
+                      xmlns:wsa="http://www.w3.org/2005/08/addressing"
+                      xmlns:tev="http://www.onvif.org/ver10/events/wsdl">
+  <env:Header>
+    <wsa:ReplyTo>
+      <wsa:Address>http://anon</wsa:Address>
+      <wsa:ReferenceParameters>
+        <decoy:NotTheRealOne xmlns:decoy="urn:decoy">DO-NOT-PICK</decoy:NotTheRealOne>
+      </wsa:ReferenceParameters>
+    </wsa:ReplyTo>
+  </env:Header>
+  <env:Body><tev:CreatePullPointSubscriptionResponse>
+    <tev:SubscriptionReference>
+      <wsa:Address>http://camera/sub</wsa:Address>
+      <wsa:ReferenceParameters>
+        <dom0:SubscriptionId xmlns:dom0="http://www.axis.com/2009/event">297</dom0:SubscriptionId>
+      </wsa:ReferenceParameters>
+    </tev:SubscriptionReference>
+  </tev:CreatePullPointSubscriptionResponse></env:Body>
+</env:Envelope>`
+	got := extractReferenceParameters(body)
+	assert.Contains(t, got, "SubscriptionId")
+	assert.Contains(t, got, "297")
+	assert.NotContains(t, got, "DO-NOT-PICK",
+		"ref params from wsa:ReplyTo must not leak through — only SubscriptionReference's children belong on PullMessages")
+}
+
+// When a vendor declares the namespace prefix on the parent
+// <ReferenceParameters> element rather than the child (legal XML, just
+// different from AXIS's shape), naïve inner-only extraction strips the
+// declaration and produces children with orphaned prefixes that fail
+// to round-trip. Inheritance must propagate ancestor xmlns onto each
+// child before serialisation.
+func TestBuildRefParamsHeader_InheritsParentXmlns(t *testing.T) {
+	parentScopedXmlns := `<wsa:ReferenceParameters xmlns:dom0="urn:vendor:axis">` +
+		`<dom0:SubscriptionId>297</dom0:SubscriptionId>` +
+		`</wsa:ReferenceParameters>`
+	got, err := buildRefParamsHeader(parentScopedXmlns)
+	require.NoError(t, err)
+	assert.NotContains(t, got, "ReferenceParameters",
+		"the wrapping element must not appear in output — each param child is its own header block")
+	assert.Contains(t, got, "SubscriptionId")
+	assert.Contains(t, got, "297")
+	assert.Contains(t, got, `xmlns:dom0="urn:vendor:axis"`,
+		"the dom0 prefix is undeclared on the child itself — it must be inherited from the parent so the standalone child stays valid XML")
+	assert.Contains(t, got, `IsReferenceParameter="true"`)
+}
+
+// Pins the contract change: extractReferenceParameters returns the
+// full <ReferenceParameters> element (including its own attributes),
+// not just the inner content, so parent-scoped xmlns survives into
+// buildRefParamsHeader.
+func TestExtractReferenceParameters_IncludesParentElementForXmlnsPreservation(t *testing.T) {
+	body := `<env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope"
+                      xmlns:wsa="http://www.w3.org/2005/08/addressing"
+                      xmlns:tev="http://www.onvif.org/ver10/events/wsdl">
+  <env:Body><tev:CreatePullPointSubscriptionResponse>
+    <tev:SubscriptionReference>
+      <wsa:Address>http://camera</wsa:Address>
+      <wsa:ReferenceParameters xmlns:dom0="urn:vendor:axis">
+        <dom0:SubscriptionId>297</dom0:SubscriptionId>
+      </wsa:ReferenceParameters>
+    </tev:SubscriptionReference>
+  </tev:CreatePullPointSubscriptionResponse></env:Body>
+</env:Envelope>`
+	got := extractReferenceParameters(body)
+	assert.Contains(t, got, "ReferenceParameters",
+		"extractor must include the wrapping element so parent-scoped xmlns survives")
+	assert.Contains(t, got, `xmlns:dom0="urn:vendor:axis"`)
+	assert.Contains(t, got, "SubscriptionId")
+}
+
+// --- Camera-granted TerminationTime -----------------------------------
+//
+// Cameras may grant a shorter subscription than we ask for. Scheduling
+// the next renew from opts.InitialTermination instead of what the
+// camera actually granted leads to expired subscriptions and the
+// recreate-recovery path firing unnecessarily.
+
+func TestCreatePullPoint_CapturesGrantedTermination(t *testing.T) {
+	body := `<env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope"
+                      xmlns:wsa="http://www.w3.org/2005/08/addressing"
+                      xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2"
+                      xmlns:tev="http://www.onvif.org/ver10/events/wsdl">
+  <env:Body><tev:CreatePullPointSubscriptionResponse>
+    <tev:SubscriptionReference><wsa:Address>http://camera/sub</wsa:Address></tev:SubscriptionReference>
+    <wsnt:CurrentTime>2026-05-27T13:19:11Z</wsnt:CurrentTime>
+    <wsnt:TerminationTime>2026-05-27T13:21:11Z</wsnt:TerminationTime>
+  </tev:CreatePullPointSubscriptionResponse></env:Body>
+</env:Envelope>`
+	fc := newFakeCaller()
+	fc.queueCallMethod(body, nil)
+	ref, err := createPullPoint(fc, defaultOptions())
+	require.NoError(t, err)
+	expected, _ := time.Parse(time.RFC3339, "2026-05-27T13:21:11Z")
+	assert.Equal(t, expected, ref.GrantedTermination)
+}
+
+func TestCreatePullPoint_NoTerminationTimeYieldsZeroTime(t *testing.T) {
+	body := `<env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope"
+                      xmlns:wsa="http://www.w3.org/2005/08/addressing"
+                      xmlns:tev="http://www.onvif.org/ver10/events/wsdl">
+  <env:Body><tev:CreatePullPointSubscriptionResponse>
+    <tev:SubscriptionReference><wsa:Address>http://camera/sub</wsa:Address></tev:SubscriptionReference>
+  </tev:CreatePullPointSubscriptionResponse></env:Body>
+</env:Envelope>`
+	fc := newFakeCaller()
+	fc.queueCallMethod(body, nil)
+	ref, err := createPullPoint(fc, defaultOptions())
+	require.NoError(t, err)
+	assert.True(t, ref.GrantedTermination.IsZero(),
+		"absent TerminationTime must yield zero so renew falls back to opts")
+}
+
+func TestNextRenewInterval_UsesGrantedTerminationMinusMargin(t *testing.T) {
+	now := time.Date(2026, 5, 27, 13, 0, 0, 0, time.UTC)
+	granted := now.Add(60 * time.Second)
+	opts := Options{InitialTermination: 60 * time.Second, RenewMargin: 10 * time.Second}
+	assert.Equal(t, 50*time.Second, nextRenewInterval(granted, opts, now))
+}
+
+func TestNextRenewInterval_FallsBackToInitialTerminationWhenGrantedZero(t *testing.T) {
+	now := time.Date(2026, 5, 27, 13, 0, 0, 0, time.UTC)
+	opts := Options{InitialTermination: 60 * time.Second, RenewMargin: 10 * time.Second}
+	assert.Equal(t, 50*time.Second, nextRenewInterval(time.Time{}, opts, now))
+}
+
+func TestNextRenewInterval_FloorsAtOneSecondIfAlreadyExpired(t *testing.T) {
+	now := time.Date(2026, 5, 27, 13, 0, 0, 0, time.UTC)
+	granted := now.Add(-1 * time.Second) // camera says we're already expired
+	opts := Options{InitialTermination: 60 * time.Second, RenewMargin: 10 * time.Second}
+	assert.Equal(t, time.Second, nextRenewInterval(granted, opts, now),
+		"never sleep zero or negative — recreate-recovery handles the truly-dead case")
+}
+
+func TestBuildRefParamsHeader_MalformedXMLReturnsError(t *testing.T) {
+	_, err := buildRefParamsHeader("<not-closed")
+	require.Error(t, err)
+}
+
+func TestBuildRefParamsHeader_WhitespaceOnlyReturnsEmpty(t *testing.T) {
+	got, err := buildRefParamsHeader("   \n\t ")
+	require.NoError(t, err)
+	assert.Empty(t, got)
 }

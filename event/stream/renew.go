@@ -10,53 +10,71 @@ import (
 	"github.com/kerberos-io/onvif/xsd"
 )
 
-// renewLoop surfaces renew failures and continues. A permanently
-// failing renew lets the subscription die at the camera; the pull
-// loop's reconnect path then recreates it — recreate is the only
-// reliable recovery once a subscription is GC'd.
+// renewLoop sleeps until the next deadline (camera-granted termination
+// minus RenewMargin), renews, and repeats. A permanently failing
+// renew lets the subscription die at the camera; the pull loop's
+// reconnect path then recreates it — recreate is the only reliable
+// recovery once a subscription is GC'd.
 func (s *Stream) renewLoop(ctx context.Context) {
-	interval := s.opts.InitialTermination - s.opts.RenewMargin
-	if interval <= 0 {
-		// Pathological config (margin >= termination): renew at
-		// half termination so we still refresh.
-		interval = s.opts.InitialTermination / 2
-		if interval <= 0 {
-			interval = time.Second
-		}
-	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
 	for {
-		select {
-		case <-ctx.Done():
+		ref := s.getPullPoint()
+		if !sleepCtx(ctx, nextRenewInterval(ref.GrantedTermination, s.opts, time.Now())) {
 			return
-		case <-ticker.C:
-			if err := renewPullPoint(s.caller, s.getPullPoint(), s.opts); err != nil {
-				s.surfaceError(ErrRenewFailed{Err: err})
-			}
+		}
+		granted, err := renewPullPoint(s.caller, s.getPullPoint(), s.opts)
+		if err != nil {
+			s.surfaceError(ErrRenewFailed{Err: err})
+			continue
+		}
+		if !granted.IsZero() {
+			s.updateGrantedTermination(granted)
 		}
 	}
+}
+
+// nextRenewInterval prefers the camera-granted termination so we never
+// schedule a renew past the actual expiry, with opts.InitialTermination
+// as the fallback when the camera didn't supply one.
+func nextRenewInterval(granted time.Time, opts Options, now time.Time) time.Duration {
+	var base time.Duration
+	if !granted.IsZero() {
+		base = granted.Sub(now)
+	} else {
+		base = opts.InitialTermination
+	}
+	d := base - opts.RenewMargin
+	if d <= 0 {
+		d = base / 2
+	}
+	if d <= 0 {
+		d = time.Second
+	}
+	return d
 }
 
 // renewPullPoint sends Renew with an absolute UTC TerminationTime.
 // WS-BaseNotification §6.1.1 also allows xsd:duration but older
 // Hikvision, some Dahua and some Bosch firmwares reject the
-// relative form.
-func renewPullPoint(c caller, ref subscriptionRef, opts Options) error {
+// relative form. Returns the camera-granted TerminationTime parsed
+// from the response (zero on absence) so the caller can reschedule.
+func renewPullPoint(c caller, ref subscriptionRef, opts Options) (time.Time, error) {
 	absoluteEnd := time.Now().UTC().Add(opts.InitialTermination).Format("2006-01-02T15:04:05Z")
 	req := event.Renew{TerminationTime: xsd.String(absoluteEnd)}
 	body, err := xml.Marshal(req)
 	if err != nil {
-		return fmt.Errorf("marshal Renew: %w", err)
+		return time.Time{}, fmt.Errorf("marshal Renew: %w", err)
 	}
 	headerXML, err := buildRefParamsHeader(ref.RefParamsXML)
 	if err != nil {
-		return fmt.Errorf("build ref params header: %w", err)
+		return time.Time{}, fmt.Errorf("build ref params header: %w", err)
 	}
 	resp, err := c.SendSoapWithHeader(ref.Address, string(body), headerXML)
 	if err != nil {
-		return enrichSOAPErr(resp, err)
+		return time.Time{}, enrichSOAPErr(resp, err)
 	}
-	_, err = readClose(resp)
-	return err
+	respBody, err := readClose(resp)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return extractTerminationTime(respBody), nil
 }

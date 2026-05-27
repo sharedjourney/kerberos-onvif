@@ -134,8 +134,6 @@ const createPullPointResp = `<?xml version="1.0" encoding="UTF-8"?>
       <tev:SubscriptionReference>
         <wsa:Address>http://camera.local/onvif/Events/PullSub_1</wsa:Address>
       </tev:SubscriptionReference>
-      <tev:CurrentTime>2026-05-21T10:30:00Z</tev:CurrentTime>
-      <tev:TerminationTime>2026-05-21T10:31:00Z</tev:TerminationTime>
     </tev:CreatePullPointSubscriptionResponse>
   </env:Body>
 </env:Envelope>`

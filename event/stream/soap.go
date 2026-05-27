@@ -17,11 +17,17 @@ import (
 	"github.com/kerberos-io/onvif/xsd"
 )
 
-// maxResponseBytes caps SOAP response buffering. ONVIF PullMessages
-// bodies are normally <100KB even with dense analytics payloads;
-// 10 MiB is comfortably above legitimate traffic while keeping a
-// hostile or buggy camera from OOMing the process.
+// maxResponseBytes caps SOAP response buffering on success paths.
+// ONVIF PullMessages bodies are normally <100KB even with dense
+// analytics payloads; 10 MiB is well above legitimate traffic while
+// keeping a hostile or buggy camera from OOMing the process.
 const maxResponseBytes = 10 << 20
+
+// maxErrorBodyBytes caps the body read by enrichSOAPErr. The pull
+// retry loop runs every RetryBackoff (~1s) so an unbounded read on
+// the error path would churn 10 MiB/s per wedged camera. Fault bodies
+// are always small.
+const maxErrorBodyBytes = 64 << 10
 
 func createPullPoint(c caller, opts Options) (subscriptionRef, error) {
 	term := xsd.String(durationToXSD(opts.InitialTermination))
@@ -50,8 +56,29 @@ func createPullPoint(c caller, opts Options) (subscriptionRef, error) {
 	if addr == "" {
 		return subscriptionRef{}, errors.New("CreatePullPointSubscription response has empty SubscriptionReference Address")
 	}
-	return subscriptionRef{Address: addr, RefParamsXML: extractReferenceParameters(body)}, nil
+	return subscriptionRef{
+		Address:            addr,
+		RefParamsXML:       extractReferenceParameters(body),
+		GrantedTermination: extractTerminationTime(body),
+	}, nil
 }
+
+// extractTerminationTime parses the absolute UTC instant the camera
+// granted as the subscription expiry. Returns zero on absence or parse
+// failure — callers fall back to opts.InitialTermination.
+func extractTerminationTime(body string) time.Time {
+	m := terminationTimeRE.FindStringSubmatch(body)
+	if len(m) < 2 {
+		return time.Time{}
+	}
+	t, err := time.Parse(time.RFC3339, strings.TrimSpace(m[1]))
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
+
+var terminationTimeRE = regexp.MustCompile(`(?s)<(?:[^:>\s]+:)?TerminationTime\b[^>]*>(.*?)</(?:[^:>\s]+:)?TerminationTime>`)
 
 // pullMessages returns an empty slice (no error) when the camera had
 // nothing within PullTimeout.
@@ -159,31 +186,47 @@ var (
 	soap12FaultRE = regexp.MustCompile(`(?s)<(?:[^:>\s]+:)?Reason\b[^>]*>.*?<(?:[^:>\s]+:)?Text[^>]*>(.*?)</(?:[^:>\s]+:)?Text>`)
 	// SOAP 1.2 Subcode: <Code>...<Subcode><Value>ter:InvalidArgs</Value></Subcode>...
 	soap12SubcodeRE = regexp.MustCompile(`(?s)<(?:[^:>\s]+:)?Subcode\b[^>]*>.*?<(?:[^:>\s]+:)?Value[^>]*>(.*?)</(?:[^:>\s]+:)?Value>`)
+
+	// WS-Security blocks may carry our Username/Password if the camera
+	// echoes the request in a fault; scrub before logging.
+	wsseSecurityRE = regexp.MustCompile(`(?s)<(?:[^:>\s]+:)?Security\b[^>]*>.*?</(?:[^:>\s]+:)?Security>`)
 )
 
-// extractSOAPFault returns the reason text from a SOAP fault or empty
-// when the body is not a fault. Handles SOAP 1.1 (faultstring) and
-// SOAP 1.2 (Reason/Text) shapes.
+// extractSOAPFault returns the reason text from a SOAP fault, falling
+// back to the Subcode value when Reason/Text is empty (AXIS pattern).
+// Returns "" when the body is not a fault.
 func extractSOAPFault(body string) string {
 	if !strings.Contains(body, "Fault") {
 		return ""
 	}
 	if m := soap11FaultRE.FindStringSubmatch(body); len(m) > 1 {
-		return strings.TrimSpace(m[1])
+		if r := strings.TrimSpace(m[1]); r != "" {
+			return r
+		}
 	}
 	if m := soap12FaultRE.FindStringSubmatch(body); len(m) > 1 {
-		return strings.TrimSpace(m[1])
+		if r := strings.TrimSpace(m[1]); r != "" {
+			return r
+		}
 	}
-	return ""
+	return extractSOAPSubcode(body)
 }
 
-var refParamsRE = regexp.MustCompile(`(?s)<(?:[^:>\s]+:)?ReferenceParameters\b[^>]*>(.*?)</(?:[^:>\s]+:)?ReferenceParameters>`)
+// Anchored to SubscriptionReference because other WS-Addressing
+// endpoint references in the same envelope (wsa:ReplyTo, wsa:FaultTo,
+// wsa:From) may also carry ReferenceParameters that are not ours.
+var (
+	subscriptionRefRE = regexp.MustCompile(`(?s)<(?:[^:>\s]+:)?SubscriptionReference\b[^>]*>(.*?)</(?:[^:>\s]+:)?SubscriptionReference>`)
+	refParamsRE       = regexp.MustCompile(`(?s)<(?:[^:>\s]+:)?ReferenceParameters\b[^>]*>(.*?)</(?:[^:>\s]+:)?ReferenceParameters>`)
+)
 
 // buildRefParamsHeader produces the SOAP <Header> inner XML for a set
-// of WS-Addressing ReferenceParameters: each top-level child element
-// is re-emitted with wsa:IsReferenceParameter="true" added, as the
-// spec requires. Empty input yields empty output (no-op for vendors
-// that encode subscription identity in the URL).
+// of WS-Addressing ReferenceParameters: each ref-param element is
+// re-emitted with wsa:IsReferenceParameter="true" and any xmlns:*
+// it inherited from the parent <ReferenceParameters> element. Input
+// may be either the raw children or the full <*:ReferenceParameters>
+// wrapper — extractReferenceParameters returns the wrapper so parent-
+// scoped namespace declarations survive into the rebuild.
 func buildRefParamsHeader(rawXML string) (string, error) {
 	if strings.TrimSpace(rawXML) == "" {
 		return "", nil
@@ -196,11 +239,23 @@ func buildRefParamsHeader(rawXML string) (string, error) {
 	if wrap == nil {
 		return "", errors.New("parse ref params: missing wrap root")
 	}
+
+	children := wrap.ChildElements()
+	var ambient *etree.Element
+	if len(children) == 1 && strings.HasSuffix(children[0].Tag, "ReferenceParameters") {
+		ambient = children[0]
+		children = ambient.ChildElements()
+	}
+
 	var out strings.Builder
-	for _, child := range wrap.ChildElements() {
-		child.CreateAttr("wsa:IsReferenceParameter", "true")
+	for _, child := range children {
+		c := child.Copy()
+		if ambient != nil {
+			inheritXmlns(c, ambient)
+		}
+		c.CreateAttr("wsa:IsReferenceParameter", "true")
 		d := etree.NewDocument()
-		d.SetRoot(child.Copy())
+		d.SetRoot(c)
 		s, err := d.WriteToString()
 		if err != nil {
 			return "", fmt.Errorf("serialise ref param child: %w", err)
@@ -210,16 +265,37 @@ func buildRefParamsHeader(rawXML string) (string, error) {
 	return out.String(), nil
 }
 
+// inheritXmlns copies xmlns / xmlns:* declarations from src onto dst
+// when dst doesn't already declare them, so a child whose namespace
+// prefix was declared on an ancestor stays valid in isolation.
+func inheritXmlns(dst, src *etree.Element) {
+	for _, attr := range src.Attr {
+		isDefault := attr.Space == "" && attr.Key == "xmlns"
+		isPrefixed := attr.Space == "xmlns"
+		if !isDefault && !isPrefixed {
+			continue
+		}
+		key := attr.Key
+		if isPrefixed {
+			key = "xmlns:" + attr.Key
+		}
+		if dst.SelectAttr(key) != nil {
+			continue
+		}
+		dst.CreateAttr(key, attr.Value)
+	}
+}
+
 // extractReferenceParameters returns the verbatim inner XML so callers
 // can echo it (with wsa:IsReferenceParameter="true") into the SOAP
 // Header of subscription-scoped requests per WS-Addressing 1.0 §3.1.
 // Without that echo, AXIS rejects PullMessages with ter:InvalidArgs.
 func extractReferenceParameters(body string) string {
-	m := refParamsRE.FindStringSubmatch(body)
-	if len(m) < 2 {
+	sub := subscriptionRefRE.FindStringSubmatch(body)
+	if len(sub) < 2 {
 		return ""
 	}
-	return strings.TrimSpace(m[1])
+	return strings.TrimSpace(refParamsRE.FindString(sub[1]))
 }
 
 // extractSOAPSubcode is the fallback when Reason/Text is empty — AXIS
@@ -251,22 +327,19 @@ func enrichSOAPErr(resp *http.Response, err error) error {
 		return err
 	}
 	defer resp.Body.Close()
-	b, readErr := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	b, readErr := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
 	if readErr != nil || len(b) == 0 {
 		return err
 	}
-	body := string(b)
+	body := wsseSecurityRE.ReplaceAllString(string(b), "<Security>[REDACTED]</Security>")
 	if reason := extractSOAPFault(body); reason != "" {
-		return fmt.Errorf("%w: SOAP fault: %s", err, reason)
-	}
-	if sub := extractSOAPSubcode(body); sub != "" {
-		return fmt.Errorf("%w: SOAP fault subcode: %s", err, sub)
+		return fmt.Errorf("SOAP fault: %s: %w", reason, err)
 	}
 	excerpt := strings.TrimSpace(body)
 	if len(excerpt) > maxErrExcerpt {
 		excerpt = excerpt[:maxErrExcerpt] + "...(truncated)"
 	}
-	return fmt.Errorf("%w: response body: %s", err, excerpt)
+	return fmt.Errorf("response body: %s: %w", excerpt, err)
 }
 
 // durationToXSD formats a duration as xsd:duration PTnS. Second

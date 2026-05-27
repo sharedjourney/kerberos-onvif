@@ -333,7 +333,7 @@ func (dev *Device) GetEndpointByRequestStruct(requestStruct interface{}) (string
 	return resp, err
 }*/
 
-// CallMethod functions call an method, defined <method> struct with authentication data
+// SendSoap POSTs the given body wrapped in a SOAP envelope.
 func (dev Device) SendSoap(endpoint string, xmlRequestBody string) (*http.Response, error) {
 	return dev.SendSoapWithHeader(endpoint, xmlRequestBody, "")
 }
@@ -342,13 +342,20 @@ func (dev Device) SendSoap(endpoint string, xmlRequestBody string) (*http.Respon
 // needed to echo WS-Addressing ReferenceParameters (with
 // wsa:IsReferenceParameter="true") back to vendors like AXIS that
 // identify pull-point subscriptions through them rather than the URL.
+//
+// xmlHeaderContent must be well-formed XML representing zero or more
+// SOAP Header child elements (sibling top-level elements are
+// supported; the spec lets each reference parameter be its own header
+// block). The caller is responsible for escaping any externally
+// sourced data inside it. Malformed XML returns an error before any
+// request is made.
 func (dev Device) SendSoapWithHeader(endpoint, xmlRequestBody, xmlHeaderContent string) (*http.Response, error) {
 	soap := gosoap.NewEmptySOAP()
 	soap.AddStringBodyContent(xmlRequestBody)
 	soap.AddRootNamespaces(Xlmns)
 	soap.AddAction()
-	if xmlHeaderContent != "" {
-		_ = soap.AddStringHeaderContent(xmlHeaderContent)
+	if err := addHeaderChildren(&soap, xmlHeaderContent); err != nil {
+		return nil, err
 	}
 	if dev.params.Username != "" && dev.params.Password != "" {
 		soap.AddWSSecurity(dev.params.Username, dev.params.Password)
@@ -362,6 +369,35 @@ func (dev Device) SendSoapWithHeader(endpoint, xmlRequestBody, xmlHeaderContent 
 		servResp, err = networking.SendSoapWithDigest(dev.params.HttpClient, endpoint, soap.String(), dev.params.Username, dev.params.Password)
 	}
 	return servResp, err
+}
+
+// addHeaderChildren wraps the fragment so etree can parse multi-root
+// XML, then adds each top-level child as its own SOAP Header block.
+// gosoap.AddStringHeaderContent only accepts a single root element.
+func addHeaderChildren(soap *gosoap.SoapMessage, xmlHeaderContent string) error {
+	if xmlHeaderContent == "" {
+		return nil
+	}
+	doc := etree.NewDocument()
+	if err := doc.ReadFromString("<wrap>" + xmlHeaderContent + "</wrap>"); err != nil {
+		return fmt.Errorf("parse header content: %w", err)
+	}
+	wrap := doc.SelectElement("wrap")
+	if wrap == nil {
+		return errors.New("parse header content: missing wrap root")
+	}
+	for _, child := range wrap.ChildElements() {
+		d := etree.NewDocument()
+		d.SetRoot(child.Copy())
+		s, err := d.WriteToString()
+		if err != nil {
+			return fmt.Errorf("serialise header child: %w", err)
+		}
+		if err := soap.AddStringHeaderContent(s); err != nil {
+			return fmt.Errorf("add header child: %w", err)
+		}
+	}
+	return nil
 }
 
 func createHttpRequest(httpMethod string, endpoint string, soap string) (req *http.Request, err error) {

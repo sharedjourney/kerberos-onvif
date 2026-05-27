@@ -116,9 +116,14 @@ func (o Options) withDefaults() Options {
 // other vendors put the identity in the Address itself, leaving
 // RefParamsXML empty. Subscription-scoped requests must echo a
 // non-empty RefParamsXML — see extractReferenceParameters.
+//
+// GrantedTermination is the absolute time the camera says the
+// subscription will expire if not renewed. May be less than
+// requested; renewLoop schedules from this rather than opts.
 type subscriptionRef struct {
-	Address      string
-	RefParamsXML string
+	Address            string
+	RefParamsXML       string
+	GrantedTermination time.Time
 }
 
 // caller is the *onvif.Device subset Stream depends on. Implementations
@@ -186,6 +191,12 @@ func (s *Stream) setPullPoint(ref subscriptionRef) {
 	s.pullPointMu.Lock()
 	defer s.pullPointMu.Unlock()
 	s.pullPoint = ref
+}
+
+func (s *Stream) updateGrantedTermination(t time.Time) {
+	s.pullPointMu.Lock()
+	defer s.pullPointMu.Unlock()
+	s.pullPoint.GrantedTermination = t
 }
 
 // NewStream creates a Stream and performs CreatePullPointSubscription

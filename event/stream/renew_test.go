@@ -175,7 +175,7 @@ func TestRenew_SendsAbsoluteDateTimeNotDuration(t *testing.T) {
 func TestRenewPullPoint_EnrichesTransportErrWithFaultReason(t *testing.T) {
 	fc := newFakeCaller()
 	fc.queueSendSoap(renewFaultBody, errors.New("400 Bad Request"))
-	err := renewPullPoint(fc, subscriptionRef{Address: "http://camera/sub"}, defaultOptions())
+	_, err := renewPullPoint(fc, subscriptionRef{Address: "http://camera/sub"}, defaultOptions())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "renew-specific complaint",
 		"renewPullPoint must enrich transport errors with the camera's SOAP fault")
@@ -194,7 +194,8 @@ func TestRenewPullPoint_EchoesRefParamsWithIsReferenceParameter(t *testing.T) {
 		RefParamsXML: `<dom0:SubscriptionId xmlns:dom0="http://www.axis.com/2009/event">297</dom0:SubscriptionId>`,
 	}
 	fc := newFakeCaller()
-	require.NoError(t, renewPullPoint(fc, ref, defaultOptions()))
+	_, err := renewPullPoint(fc, ref, defaultOptions())
+	require.NoError(t, err)
 	require.Len(t, fc.sendSoapHeaders, 1)
 	hdr := fc.sendSoapHeaders[0]
 	assert.Contains(t, hdr, "SubscriptionId")

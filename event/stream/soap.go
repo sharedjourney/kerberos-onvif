@@ -197,11 +197,14 @@ var (
 	// echoes the request in a fault; scrub before logging. The
 	// alternation handles the truncated case where the read cap fell
 	// between <Security> and </Security>: in that case nothing past
-	// the opening tag is safe to retain. wssePasswordRE is the
-	// belt-and-braces fallback for non-conformant cameras emitting
-	// Password / UsernameToken outside a Security wrapper.
+	// the opening tag is safe to retain — the replacement re-emits a
+	// synthetic close tag, dropping the remainder of the body excerpt
+	// (max-redact preferred to max-context for log lines).
+	// wssePasswordRE is the belt-and-braces fallback for
+	// non-conformant cameras emitting Password / UsernameToken outside
+	// a Security wrapper; same truncation handling.
 	wsseSecurityRE = regexp.MustCompile(`(?s)<(?:[^:>\s]+:)?Security\b[^>]*>(?:.*?</(?:[^:>\s]+:)?Security>|.*)`)
-	wssePasswordRE = regexp.MustCompile(`(?s)<(?:[^:>\s]+:)?Password\b[^>]*>.*?</(?:[^:>\s]+:)?Password>`)
+	wssePasswordRE = regexp.MustCompile(`(?s)<(?:[^:>\s]+:)?Password\b[^>]*>(?:.*?</(?:[^:>\s]+:)?Password>|.*)`)
 )
 
 // extractSOAPFault returns the reason text from a SOAP fault, falling
@@ -247,8 +250,11 @@ func buildRefParamsHeader(refParamsXML string) (string, error) {
 		return "", fmt.Errorf("parse ref params: %w", err)
 	}
 	wrapper := doc.Root()
-	if wrapper == nil || wrapper.Tag != "ReferenceParameters" {
-		return "", fmt.Errorf("ref params root must be <*:ReferenceParameters>, got <%s>", rootTag(wrapper))
+	if wrapper == nil {
+		return "", errors.New("ref params has no root element")
+	}
+	if wrapper.Tag != "ReferenceParameters" {
+		return "", fmt.Errorf("ref params root must be <*:ReferenceParameters>, got <%s>", wrapper.Tag)
 	}
 	var out strings.Builder
 	for _, child := range wrapper.ChildElements() {
@@ -264,13 +270,6 @@ func buildRefParamsHeader(refParamsXML string) (string, error) {
 		out.WriteString(strings.TrimRight(s, "\n"))
 	}
 	return out.String(), nil
-}
-
-func rootTag(e *etree.Element) string {
-	if e == nil {
-		return ""
-	}
-	return e.Tag
 }
 
 // inheritXmlns copies xmlns / xmlns:* declarations from src onto dst

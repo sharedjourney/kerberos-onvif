@@ -680,3 +680,42 @@ func TestExtractReferenceParameters_EmptySubscriptionReferenceReturnsEmpty(t *te
 </env:Envelope>`
 	assert.Empty(t, extractReferenceParameters(body))
 }
+
+func TestEnrichSOAPErr_RedactsTruncatedPasswordOutsideSecurity(t *testing.T) {
+	body := `<env:Envelope xmlns:env="x"><env:Body>` +
+		`<wsse:UsernameToken xmlns:wsse="y">` +
+		`<wsse:Username>admin</wsse:Username>` +
+		`<wsse:Password>hunter2` // truncated — no </Password>, no </UsernameToken>, no </Envelope>
+	got := enrichSOAPErr(fakeResponse(body), errors.New("500"))
+	require.Error(t, got)
+	assert.NotContains(t, got.Error(), "hunter2",
+		"Password without a closing tag (truncated at cap) must still be redacted")
+}
+
+func TestEnrichSOAPErr_RedactsMultipleSecurityBlocks(t *testing.T) {
+	body := `<E>` +
+		`<wsse:Security xmlns:wsse="y"><wsse:Password>secret1</wsse:Password></wsse:Security>` +
+		`<wsse:Security xmlns:wsse="y"><wsse:Password>secret2</wsse:Password></wsse:Security>` +
+		`</E>`
+	got := enrichSOAPErr(fakeResponse(body), errors.New("500"))
+	require.Error(t, got)
+	assert.NotContains(t, got.Error(), "secret1")
+	assert.NotContains(t, got.Error(), "secret2",
+		"ReplaceAllString must catch every Security block, not just the first")
+}
+
+func TestBuildRefParamsHeader_RejectsNonReferenceParametersRoot_Table(t *testing.T) {
+	cases := []struct {
+		name, raw string
+	}{
+		{"vendor suffix", `<my:MyReferenceParameters xmlns:my="urn:x">X</my:MyReferenceParameters>`},
+		{"multi-root", `<a:Foo xmlns:a="ns/a"/><b:Bar xmlns:b="ns/b"/>`},
+		{"unrelated element", `<not-the-wrapper>content</not-the-wrapper>`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := buildRefParamsHeader(c.raw)
+			require.Error(t, err)
+		})
+	}
+}

@@ -19,15 +19,14 @@ import (
 // reliable recovery once a subscription is GC'd.
 func (s *Stream) renewLoop(ctx context.Context) {
 	for {
-		ref := s.getPullPoint()
-		gen := s.pullPointGen()
+		ref, gen := s.snapshotPullPoint()
 		if !sleepCtx(ctx, nextRenewInterval(ref.GrantedTermination, s.opts, s.now())) {
 			return
 		}
 		granted, err := renewPullPoint(s.caller, s.getPullPoint(), s.opts)
 		if err != nil {
 			s.surfaceError(ErrRenewFailed{Err: err})
-			if !sleepCtx(ctx, nextRenewIntervalAfterError(ref.GrantedTermination, s.opts, s.now())) {
+			if !sleepCtx(ctx, nextRenewIntervalAfterError(s.opts)) {
 				return
 			}
 			continue
@@ -58,12 +57,12 @@ func nextRenewInterval(granted time.Time, opts Options, now time.Time) time.Dura
 	return d
 }
 
-// nextRenewIntervalAfterError ignores GrantedTermination — by the time
-// renew has failed once, the grant is typically already in the past
-// and nextRenewInterval would floor to 1s, hammering the camera.
+// nextRenewIntervalAfterError returns the post-failure sleep. The
+// grant is typically already in the past by the time renew has failed
+// once, so nextRenewInterval would floor to 1s and hammer the camera.
 // Recovery is the pull loop's reconnect path; we just need to not
 // accelerate retries past the configured RetryBackoff.
-func nextRenewIntervalAfterError(_ time.Time, opts Options, _ time.Time) time.Duration {
+func nextRenewIntervalAfterError(opts Options) time.Duration {
 	if opts.RetryBackoff > 0 {
 		return opts.RetryBackoff
 	}

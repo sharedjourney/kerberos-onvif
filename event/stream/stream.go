@@ -165,9 +165,9 @@ type Stream struct {
 	caller caller
 	opts   Options
 
-	pullPointMu  sync.Mutex
-	pullPoint    subscriptionRef
-	gen uint64 // bumped on every setPullPoint so renews can detect a recreate
+	pullPointMu sync.Mutex // guards pullPoint and gen
+	pullPoint   subscriptionRef
+	gen         uint64 // bumped on every setPullPoint so renews detect mid-flight recreate
 
 	events chan Event
 	errors chan error
@@ -205,10 +205,20 @@ func (s *Stream) pullPointGen() uint64 {
 	return s.gen
 }
 
+// snapshotPullPoint reads ref + gen under one lock so a concurrent
+// setPullPoint can't slip in between two separate accessor calls and
+// leave the caller with mismatched halves.
+func (s *Stream) snapshotPullPoint() (subscriptionRef, uint64) {
+	s.pullPointMu.Lock()
+	defer s.pullPointMu.Unlock()
+	return s.pullPoint, s.gen
+}
+
 // updateGrantedTerminationIfGen writes the granted time only when the
 // caller's snapshot is still current. Use setPullPoint to replace the
 // full ref; this updates GrantedTermination in place after a renew
-// response.
+// response. Intentionally does not bump gen — that would defeat the
+// rotation-detection it implements.
 func (s *Stream) updateGrantedTerminationIfGen(gen uint64, t time.Time) {
 	s.pullPointMu.Lock()
 	defer s.pullPointMu.Unlock()

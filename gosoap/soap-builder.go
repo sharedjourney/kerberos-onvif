@@ -170,6 +170,10 @@ func (msg *SoapMessage) AddStringHeaderContent(data string) error {
 // reference parameter to be a separate Header block, but a Go XML
 // document only has one root. Comments and text outside elements are
 // silently dropped.
+//
+// SECURITY: data forwards verbatim into the outbound envelope. Do not
+// pass content sourced from untrusted clients — see the same caveat
+// on onvif.Device.SendSoapWithOptions / SendSoapWithHeader.
 func (msg *SoapMessage) AddStringHeaderContents(data string) error {
 	in := etree.NewDocument()
 	if err := in.ReadFromString("<wrap>" + data + "</wrap>"); err != nil {

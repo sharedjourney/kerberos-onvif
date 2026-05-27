@@ -209,20 +209,17 @@ func TestRenewPullPoint_EchoesRefParamsWithIsReferenceParameter(t *testing.T) {
 // ticker design retried at the configured cadence regardless. After
 // a failure the loop must use a backoff decoupled from the stale
 // grant.
-func TestNextRenewIntervalAfterError_IgnoresStaleGrantedTermination(t *testing.T) {
-	now := time.Date(2026, 5, 27, 13, 0, 0, 0, time.UTC)
-	stale := now.Add(-500 * time.Millisecond)
-	opts := Options{InitialTermination: 60 * time.Second, RenewMargin: 10 * time.Second, RetryBackoff: time.Second}
-	got := nextRenewIntervalAfterError(stale, opts, now)
+func TestNextRenewIntervalAfterError_BacksOffAtLeastRetryBackoff(t *testing.T) {
+	opts := Options{RetryBackoff: time.Second}
+	got := nextRenewIntervalAfterError(opts)
 	assert.GreaterOrEqual(t, got, opts.RetryBackoff,
 		"failure path must back off at least RetryBackoff, not 1s floor on stale grant")
 }
 
-func TestNextRenewIntervalAfterError_FallsBackToRetryBackoff(t *testing.T) {
-	now := time.Date(2026, 5, 27, 13, 0, 0, 0, time.UTC)
-	opts := Options{InitialTermination: 60 * time.Second, RenewMargin: 10 * time.Second, RetryBackoff: 5 * time.Second}
-	got := nextRenewIntervalAfterError(time.Time{}, opts, now)
-	assert.Equal(t, opts.RetryBackoff, got)
+func TestNextRenewIntervalAfterError_DefaultsToOneSecondWhenRetryBackoffZero(t *testing.T) {
+	got := nextRenewIntervalAfterError(Options{})
+	assert.Equal(t, time.Second, got,
+		"zero RetryBackoff must yield the safety floor, not a tight 0-duration sleep")
 }
 
 // Lost-update race: renew snapshots the ref, the SOAP call returns,
@@ -231,6 +228,8 @@ func TestNextRenewIntervalAfterError_FallsBackToRetryBackoff(t *testing.T) {
 // granted time onto the NEW subscription, the new schedule is wrong.
 // Update must be conditioned on "same subscription as when I read."
 func TestUpdateGrantedTermination_DropsWriteWhenSubscriptionRotated(t *testing.T) {
+	// s.now is intentionally nil — this test does not exercise any
+	// time-dependent path; only the gen-counter accessors.
 	s := &Stream{}
 	original := subscriptionRef{Address: "http://camera/sub-A"}
 	s.setPullPoint(original)
@@ -248,10 +247,31 @@ func TestUpdateGrantedTermination_DropsWriteWhenSubscriptionRotated(t *testing.T
 }
 
 func TestUpdateGrantedTermination_AppliesWhenGenMatches(t *testing.T) {
+	// s.now is intentionally nil — gen-counter path only.
 	s := &Stream{}
 	s.setPullPoint(subscriptionRef{Address: "http://camera/sub"})
 	gen := s.pullPointGen()
 	t1 := time.Date(2026, 5, 27, 13, 0, 0, 0, time.UTC)
 	s.updateGrantedTerminationIfGen(gen, t1)
 	assert.Equal(t, t1, s.getPullPoint().GrantedTermination)
+}
+
+// renewLoop must capture (ref, gen) atomically. Two separate
+// getPullPoint() + pullPointGen() reads leave a window in which a
+// concurrent setPullPoint advances gen between the two reads — the
+// renew then runs against ref-N but believes its captured gen is N+1,
+// and updateGrantedTerminationIfGen("succeeds") writing the old
+// subscription's grant onto the new one. Single snapshot closes it.
+func TestSnapshotPullPoint_AtomicReadOfRefAndGen(t *testing.T) {
+	// s.now is intentionally nil — gen-counter path only.
+	s := &Stream{}
+	s.setPullPoint(subscriptionRef{Address: "A"}) // gen=1
+	ref, gen := s.snapshotPullPoint()
+	assert.Equal(t, "A", ref.Address)
+	assert.Equal(t, uint64(1), gen)
+
+	s.setPullPoint(subscriptionRef{Address: "B"}) // gen=2
+	ref, gen = s.snapshotPullPoint()
+	assert.Equal(t, "B", ref.Address)
+	assert.Equal(t, uint64(2), gen)
 }

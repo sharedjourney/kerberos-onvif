@@ -349,9 +349,11 @@ func (dev Device) SendSoap(endpoint string, xmlRequestBody string) (*http.Respon
 // element-free content errors before any request is made.
 //
 // SECURITY: do not pass content sourced from untrusted clients. The
-// API assumes the caller is authoritative for the envelope; injected
-// <wsse:Security> or <wsa:Action> in the header forwards verbatim and
-// may override envelope defaults under our credentials.
+// API assumes the caller is authoritative for the envelope. Header
+// content forwards verbatim — among others, <wsse:Security> overrides
+// auth, <wsa:Action> overrides intent, <wsa:To>/<wsa:ReplyTo>/
+// <wsa:FaultTo> redirect responses, <wsa:MessageID> enables replay-
+// token forgery, and <wsu:Timestamp> bypasses freshness checks.
 func (dev Device) SendSoapWithHeader(endpoint, xmlRequestBody, xmlHeaderContent string) (*http.Response, error) {
 	return dev.SendSoapWithOptions(endpoint, xmlRequestBody, WithSOAPHeader(xmlHeaderContent))
 }

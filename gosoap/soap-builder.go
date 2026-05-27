@@ -166,7 +166,7 @@ func (msg *SoapMessage) AddStringHeaderContent(data string) error {
 // AddStringHeaderContents is the multi-root variant of
 // AddStringHeaderContent: it accepts any number of top-level sibling
 // elements (zero is an error) and appends each as its own SOAP Header
-// child. Needed because WS-Addressing 1.0 §3.1 requires each
+// child. Needed because WS-Addressing 1.0 SOAP Binding §3.4 requires each
 // reference parameter to be a separate Header block, but a Go XML
 // document only has one root. Comments and text outside elements are
 // silently dropped.

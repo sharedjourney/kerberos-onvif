@@ -72,7 +72,7 @@ func TestDevice_SendSoapWithHeader_InjectsHeaderXML(t *testing.T) {
 		"body content must land inside SOAP <Body>")
 }
 
-// Per WS-Addressing 1.0 §3.1 every reference parameter is a separate
+// Per WS-Addressing 1.0 SOAP Binding §3.4 every reference parameter is a separate
 // SOAP Header block. Vendors that declare two ref params would silently
 // produce a header-less request if the implementation only accepts a
 // single top-level element.

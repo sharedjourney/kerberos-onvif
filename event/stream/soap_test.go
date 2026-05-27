@@ -226,7 +226,7 @@ func TestUnsubscribePullPoint_EnrichesTransportErrWithFaultReason(t *testing.T) 
 		"unsubscribePullPoint must enrich transport errors with the camera's SOAP fault")
 }
 
-// --- ReferenceParameters extraction (WS-Addressing 1.0 §3.1) ---------
+// --- ReferenceParameters extraction (WS-Addressing 1.0 SOAP Binding §3.4) ---------
 //
 // AXIS encodes the subscription identity in <wsa:ReferenceParameters>
 // inside CreatePullPointSubscriptionResponse rather than in the URL
@@ -307,7 +307,7 @@ func TestCreatePullPoint_VendorWithoutRefParams_RefParamsEmpty(t *testing.T) {
 
 // --- Reference-parameter echoing in subscription-scoped calls --------
 //
-// WS-Addressing 1.0 §3.1 requires each <wsa:ReferenceParameters> child
+// WS-Addressing 1.0 SOAP Binding §3.4 requires each <wsa:ReferenceParameters> child
 // to be echoed as a SOAP Header block carrying wsa:IsReferenceParameter
 // ="true". AXIS rejects PullMessages with ter:InvalidArgs when this is
 // absent.
@@ -325,7 +325,7 @@ func TestPullMessages_EchoesRefParamsWithIsReferenceParameterAttribute(t *testin
 	assert.Contains(t, hdr, "SubscriptionId", "ref param element must be echoed")
 	assert.Contains(t, hdr, "297", "ref param value must be echoed")
 	assert.Contains(t, hdr, `IsReferenceParameter="true"`,
-		"WS-Addressing 1.0 §3.1 requires the attribute on each echoed element")
+		"WS-Addressing 1.0 SOAP Binding §3.4 requires the attribute on each echoed element")
 }
 
 func TestPullMessages_NoRefParams_HeaderEmpty(t *testing.T) {
@@ -458,7 +458,7 @@ func TestExtractSOAPFault_FallsBackToSubcodeWhenReasonEmpty(t *testing.T) {
 	assert.Equal(t, "ter:InvalidArgs", extractSOAPFault(body))
 }
 
-// WS-Addressing §3.1 allows ReferenceParameters in any endpoint
+// WS-Addressing 1.0 Core §2.1 allows ReferenceParameters in any endpoint
 // reference (wsa:From, wsa:ReplyTo, wsa:FaultTo, ...). An unanchored
 // search would silently pick up the wrong one.
 func TestExtractReferenceParameters_AnchoredToSubscriptionReference(t *testing.T) {

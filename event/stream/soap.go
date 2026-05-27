@@ -295,7 +295,7 @@ func inheritXmlns(dst, src *etree.Element) {
 
 // extractReferenceParameters returns the verbatim inner XML so callers
 // can echo it (with wsa:IsReferenceParameter="true") into the SOAP
-// Header of subscription-scoped requests per WS-Addressing 1.0 §3.1.
+// Header of subscription-scoped requests per WS-Addressing 1.0 SOAP Binding §3.4.
 // Without that echo, AXIS rejects PullMessages with ter:InvalidArgs.
 func extractReferenceParameters(body string) string {
 	sub := subscriptionRefRE.FindStringSubmatch(body)

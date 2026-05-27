@@ -11,23 +11,29 @@ import (
 )
 
 // renewLoop sleeps until the next deadline (camera-granted termination
-// minus RenewMargin), renews, and repeats. A permanently failing
-// renew lets the subscription die at the camera; the pull loop's
-// reconnect path then recreates it — recreate is the only reliable
-// recovery once a subscription is GC'd.
+// minus RenewMargin), renews, and repeats. On failure it backs off via
+// nextRenewIntervalAfterError so the loop doesn't busy-loop against
+// the 1s floor when the previous grant has just expired. A permanently
+// failing renew lets the subscription die at the camera; the pull
+// loop's reconnect path then recreates it — recreate is the only
+// reliable recovery once a subscription is GC'd.
 func (s *Stream) renewLoop(ctx context.Context) {
 	for {
 		ref := s.getPullPoint()
-		if !sleepCtx(ctx, nextRenewInterval(ref.GrantedTermination, s.opts, time.Now())) {
+		gen := s.pullPointGen()
+		if !sleepCtx(ctx, nextRenewInterval(ref.GrantedTermination, s.opts, s.now())) {
 			return
 		}
 		granted, err := renewPullPoint(s.caller, s.getPullPoint(), s.opts)
 		if err != nil {
 			s.surfaceError(ErrRenewFailed{Err: err})
+			if !sleepCtx(ctx, nextRenewIntervalAfterError(ref.GrantedTermination, s.opts, s.now())) {
+				return
+			}
 			continue
 		}
 		if !granted.IsZero() {
-			s.updateGrantedTermination(granted)
+			s.updateGrantedTerminationIfGen(gen, granted)
 		}
 	}
 }
@@ -50,6 +56,18 @@ func nextRenewInterval(granted time.Time, opts Options, now time.Time) time.Dura
 		d = time.Second
 	}
 	return d
+}
+
+// nextRenewIntervalAfterError ignores GrantedTermination — by the time
+// renew has failed once, the grant is typically already in the past
+// and nextRenewInterval would floor to 1s, hammering the camera.
+// Recovery is the pull loop's reconnect path; we just need to not
+// accelerate retries past the configured RetryBackoff.
+func nextRenewIntervalAfterError(_ time.Time, opts Options, _ time.Time) time.Duration {
+	if opts.RetryBackoff > 0 {
+		return opts.RetryBackoff
+	}
+	return time.Second
 }
 
 // renewPullPoint sends Renew with an absolute UTC TerminationTime.

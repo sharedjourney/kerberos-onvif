@@ -343,36 +343,39 @@ func (dev Device) SendSoap(endpoint string, xmlRequestBody string) (*http.Respon
 // wsa:IsReferenceParameter="true") back to vendors like AXIS that
 // identify pull-point subscriptions through them rather than the URL.
 //
-// xmlHeaderContent must be well-formed XML representing zero or more
-// SOAP Header child elements (sibling top-level elements are
-// supported; the spec lets each reference parameter be its own header
-// block). The caller is responsible for escaping any externally
-// sourced data inside it. Malformed XML returns an error before any
-// request is made.
+// xmlHeaderContent must be well-formed XML representing one or more
+// SOAP Header child elements (siblings are supported; the spec lets
+// each reference parameter be its own header block). Malformed or
+// element-free content errors before any request is made.
+//
+// SECURITY: do not pass content sourced from untrusted clients. The
+// API assumes the caller is authoritative for the envelope; injected
+// <wsse:Security> or <wsa:Action> in the header forwards verbatim and
+// may override envelope defaults under our credentials.
 func (dev Device) SendSoapWithHeader(endpoint, xmlRequestBody, xmlHeaderContent string) (*http.Response, error) {
-	return dev.SendSoapWithOptions(endpoint, xmlRequestBody, WithHeader(xmlHeaderContent))
+	return dev.SendSoapWithOptions(endpoint, xmlRequestBody, WithSOAPHeader(xmlHeaderContent))
 }
 
-// SoapOption tweaks a single SendSoapWithOptions call. New options
+// SendSoapOption tweaks a single SendSoapWithOptions call. New options
 // (per-call timeout, context, custom envelope namespaces, ...) should
 // be added as WithX constructors here rather than as new method
 // variants on Device.
-type SoapOption func(*soapConfig)
+type SendSoapOption func(*soapConfig)
 
 type soapConfig struct {
 	headerContent string
 }
 
-// WithHeader adds inner-Header XML to the envelope. See
+// WithSOAPHeader adds inner-Header XML to the envelope. See
 // SendSoapWithHeader for the content contract.
-func WithHeader(xml string) SoapOption {
-	return func(c *soapConfig) { c.headerContent = xml }
+func WithSOAPHeader(headerContent string) SendSoapOption {
+	return func(c *soapConfig) { c.headerContent = headerContent }
 }
 
 // SendSoapWithOptions is the workhorse behind SendSoap and
 // SendSoapWithHeader; call it directly when you need to combine
 // options or pass options not surfaced by the convenience wrappers.
-func (dev Device) SendSoapWithOptions(endpoint, xmlRequestBody string, opts ...SoapOption) (*http.Response, error) {
+func (dev Device) SendSoapWithOptions(endpoint, xmlRequestBody string, opts ...SendSoapOption) (*http.Response, error) {
 	var cfg soapConfig
 	for _, o := range opts {
 		o(&cfg)
@@ -381,8 +384,10 @@ func (dev Device) SendSoapWithOptions(endpoint, xmlRequestBody string, opts ...S
 	soap.AddStringBodyContent(xmlRequestBody)
 	soap.AddRootNamespaces(Xlmns)
 	soap.AddAction()
-	if err := addHeaderChildren(&soap, cfg.headerContent); err != nil {
-		return nil, err
+	if cfg.headerContent != "" {
+		if err := soap.AddStringHeaderContents(cfg.headerContent); err != nil {
+			return nil, fmt.Errorf("add header content: %w", err)
+		}
 	}
 	if dev.params.Username != "" && dev.params.Password != "" {
 		soap.AddWSSecurity(dev.params.Username, dev.params.Password)
@@ -398,34 +403,6 @@ func (dev Device) SendSoapWithOptions(endpoint, xmlRequestBody string, opts ...S
 	return servResp, err
 }
 
-// addHeaderChildren wraps the fragment so etree can parse multi-root
-// XML, then adds each top-level child as its own SOAP Header block.
-// gosoap.AddStringHeaderContent only accepts a single root element.
-func addHeaderChildren(soap *gosoap.SoapMessage, xmlHeaderContent string) error {
-	if xmlHeaderContent == "" {
-		return nil
-	}
-	doc := etree.NewDocument()
-	if err := doc.ReadFromString("<wrap>" + xmlHeaderContent + "</wrap>"); err != nil {
-		return fmt.Errorf("parse header content: %w", err)
-	}
-	wrap := doc.SelectElement("wrap")
-	if wrap == nil {
-		return errors.New("parse header content: missing wrap root")
-	}
-	for _, child := range wrap.ChildElements() {
-		d := etree.NewDocument()
-		d.SetRoot(child.Copy())
-		s, err := d.WriteToString()
-		if err != nil {
-			return fmt.Errorf("serialise header child: %w", err)
-		}
-		if err := soap.AddStringHeaderContent(s); err != nil {
-			return fmt.Errorf("add header child: %w", err)
-		}
-	}
-	return nil
-}
 
 func createHttpRequest(httpMethod string, endpoint string, soap string) (req *http.Request, err error) {
 	req, err = http.NewRequest(httpMethod, endpoint, bytes.NewBufferString(soap))
@@ -457,7 +434,7 @@ func (dev *Device) CallOnvifFunction(serviceName, functionName string, data []by
 	}
 	xmlRequestBody := string(requestBody)
 
-	servResp, err := dev.SendSoap(endpoint, xmlRequestBody)
+	servResp, err := dev.SendSoapWithOptions(endpoint, xmlRequestBody)
 	if err != nil {
 		return nil, fmt.Errorf("fail to send the '%s' request for the web service '%s', %v", functionName, serviceName, err)
 	}

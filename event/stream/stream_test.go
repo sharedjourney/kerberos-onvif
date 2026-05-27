@@ -125,6 +125,10 @@ func (f *fakeCaller) sendSoapCallCount() int {
 
 // createPullPointResp is the minimal SOAP envelope the lib's existing
 // xml.Decoder + getXMLNode path can extract a pull-point address from.
+// Intentionally omits <TerminationTime> so renewLoop falls back to
+// opts.InitialTermination — tests that drive renew timing depend on
+// that path. Tests that need the camera-granted termination capture
+// path use a dedicated fixture instead.
 const createPullPointResp = `<?xml version="1.0" encoding="UTF-8"?>
 <env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope"
               xmlns:wsa="http://www.w3.org/2005/08/addressing"

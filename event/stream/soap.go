@@ -78,6 +78,12 @@ func extractTerminationTime(body string) time.Time {
 	return t
 }
 
+// terminationTimeRE matches the first <*:TerminationTime> in the body.
+// Only safe on responses that contain exactly one — currently
+// CreatePullPointSubscriptionResponse and RenewResponse via
+// extractTerminationTime. PullMessagesResponse also has a
+// TerminationTime element; do not call extractTerminationTime on pull
+// bodies.
 var terminationTimeRE = regexp.MustCompile(`(?s)<(?:[^:>\s]+:)?TerminationTime\b[^>]*>(.*?)</(?:[^:>\s]+:)?TerminationTime>`)
 
 // pullMessages returns an empty slice (no error) when the camera had
@@ -188,8 +194,14 @@ var (
 	soap12SubcodeRE = regexp.MustCompile(`(?s)<(?:[^:>\s]+:)?Subcode\b[^>]*>.*?<(?:[^:>\s]+:)?Value[^>]*>(.*?)</(?:[^:>\s]+:)?Value>`)
 
 	// WS-Security blocks may carry our Username/Password if the camera
-	// echoes the request in a fault; scrub before logging.
-	wsseSecurityRE = regexp.MustCompile(`(?s)<(?:[^:>\s]+:)?Security\b[^>]*>.*?</(?:[^:>\s]+:)?Security>`)
+	// echoes the request in a fault; scrub before logging. The
+	// alternation handles the truncated case where the read cap fell
+	// between <Security> and </Security>: in that case nothing past
+	// the opening tag is safe to retain. wssePasswordRE is the
+	// belt-and-braces fallback for non-conformant cameras emitting
+	// Password / UsernameToken outside a Security wrapper.
+	wsseSecurityRE = regexp.MustCompile(`(?s)<(?:[^:>\s]+:)?Security\b[^>]*>(?:.*?</(?:[^:>\s]+:)?Security>|.*)`)
+	wssePasswordRE = regexp.MustCompile(`(?s)<(?:[^:>\s]+:)?Password\b[^>]*>.*?</(?:[^:>\s]+:)?Password>`)
 )
 
 // extractSOAPFault returns the reason text from a SOAP fault, falling
@@ -220,39 +232,28 @@ var (
 	refParamsRE       = regexp.MustCompile(`(?s)<(?:[^:>\s]+:)?ReferenceParameters\b[^>]*>(.*?)</(?:[^:>\s]+:)?ReferenceParameters>`)
 )
 
-// buildRefParamsHeader produces the SOAP <Header> inner XML for a set
-// of WS-Addressing ReferenceParameters: each ref-param element is
-// re-emitted with wsa:IsReferenceParameter="true" and any xmlns:*
-// it inherited from the parent <ReferenceParameters> element. Input
-// may be either the raw children or the full <*:ReferenceParameters>
-// wrapper — extractReferenceParameters returns the wrapper so parent-
-// scoped namespace declarations survive into the rebuild.
-func buildRefParamsHeader(rawXML string) (string, error) {
-	if strings.TrimSpace(rawXML) == "" {
+// buildRefParamsHeader produces the SOAP <Header> inner XML from the
+// full <*:ReferenceParameters> element returned by
+// extractReferenceParameters. Each child element is re-emitted with
+// wsa:IsReferenceParameter="true" added and any xmlns:* declared on
+// the parent inherited onto it (so the standalone child stays valid).
+// Empty input yields empty output.
+func buildRefParamsHeader(refParamsXML string) (string, error) {
+	if strings.TrimSpace(refParamsXML) == "" {
 		return "", nil
 	}
 	doc := etree.NewDocument()
-	if err := doc.ReadFromString("<wrap>" + rawXML + "</wrap>"); err != nil {
+	if err := doc.ReadFromString(refParamsXML); err != nil {
 		return "", fmt.Errorf("parse ref params: %w", err)
 	}
-	wrap := doc.SelectElement("wrap")
-	if wrap == nil {
-		return "", errors.New("parse ref params: missing wrap root")
+	wrapper := doc.Root()
+	if wrapper == nil || wrapper.Tag != "ReferenceParameters" {
+		return "", fmt.Errorf("ref params root must be <*:ReferenceParameters>, got <%s>", rootTag(wrapper))
 	}
-
-	children := wrap.ChildElements()
-	var ambient *etree.Element
-	if len(children) == 1 && strings.HasSuffix(children[0].Tag, "ReferenceParameters") {
-		ambient = children[0]
-		children = ambient.ChildElements()
-	}
-
 	var out strings.Builder
-	for _, child := range children {
+	for _, child := range wrapper.ChildElements() {
 		c := child.Copy()
-		if ambient != nil {
-			inheritXmlns(c, ambient)
-		}
+		inheritXmlns(c, wrapper)
 		c.CreateAttr("wsa:IsReferenceParameter", "true")
 		d := etree.NewDocument()
 		d.SetRoot(c)
@@ -263,6 +264,13 @@ func buildRefParamsHeader(rawXML string) (string, error) {
 		out.WriteString(strings.TrimRight(s, "\n"))
 	}
 	return out.String(), nil
+}
+
+func rootTag(e *etree.Element) string {
+	if e == nil {
+		return ""
+	}
+	return e.Tag
 }
 
 // inheritXmlns copies xmlns / xmlns:* declarations from src onto dst
@@ -332,6 +340,7 @@ func enrichSOAPErr(resp *http.Response, err error) error {
 		return err
 	}
 	body := wsseSecurityRE.ReplaceAllString(string(b), "<Security>[REDACTED]</Security>")
+	body = wssePasswordRE.ReplaceAllString(body, "<Password>[REDACTED]</Password>")
 	if reason := extractSOAPFault(body); reason != "" {
 		return fmt.Errorf("SOAP fault: %s: %w", reason, err)
 	}

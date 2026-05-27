@@ -103,6 +103,23 @@ func TestDevice_SendSoapWithHeader_AcceptsMultipleTopLevelChildren(t *testing.T)
 	assert.Contains(t, headerSlice, "Bar")
 }
 
+func TestDevice_SendSoapWithHeader_RejectsElementFreeContent(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+	dev := Device{params: DeviceParams{HttpClient: srv.Client()}}
+
+	// Well-formed XML but contains no child elements — would otherwise
+	// parse, yield zero ChildElements, and send a header-less request.
+	_, err := dev.SendSoapWithHeader(srv.URL, "<body/>", "just text content")
+	require.Error(t, err)
+	assert.Equal(t, 0, hits,
+		"non-empty header content with no element children must fail fast")
+}
+
 // SendSoapWithOptions is the variadic shape that future per-call
 // options (timeout, context, ...) will hang off. SendSoap and
 // SendSoapWithHeader stay as thin convenience wrappers so existing
@@ -119,7 +136,7 @@ func TestDevice_SendSoapWithOptions_WithHeaderMatchesSendSoapWithHeader(t *testi
 	t.Cleanup(srv.Close)
 
 	dev := Device{params: DeviceParams{HttpClient: srv.Client()}}
-	resp, err := dev.SendSoapWithOptions(srv.URL, bodyXML, WithHeader(headerXML))
+	resp, err := dev.SendSoapWithOptions(srv.URL, bodyXML, WithSOAPHeader(headerXML))
 	require.NoError(t, err)
 	if resp != nil && resp.Body != nil {
 		resp.Body.Close()
@@ -194,4 +211,58 @@ func TestDevice_SendSoapWithHeader_PropagatesMalformedHeaderError(t *testing.T) 
 	require.Error(t, err)
 	assert.Equal(t, 0, hits,
 		"malformed header XML must fail fast — no request should reach the camera with a missing header block")
+}
+
+// Digest retry: networking.SendSoapWithDigest strips the wsse:Security
+// element from the envelope before re-POSTing so credentials don't go
+// on the wire twice (once via WS-Security, once via the digest header).
+// Pin the behaviour from the Device layer.
+func TestDevice_SendSoapWithOptions_DigestRetryStripsWSSE(t *testing.T) {
+	var authedBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="onvif", nonce="abc", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		b, _ := io.ReadAll(r.Body)
+		authedBody = string(b)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	dev := Device{params: DeviceParams{
+		HttpClient: srv.Client(),
+		Username:   "admin",
+		Password:   "secret",
+	}}
+	resp, err := dev.SendSoapWithOptions(srv.URL, "<tev:X xmlns:tev='x'/>")
+	require.NoError(t, err)
+	if resp != nil && resp.Body != nil {
+		resp.Body.Close()
+	}
+	require.NotEmpty(t, authedBody, "expected an authenticated POST after the 401 challenge")
+	assert.NotContains(t, authedBody, "UsernameToken",
+		"digest retry must strip wsse:Security/UsernameToken; otherwise credentials go on the wire twice")
+}
+
+// Last-write-wins on duplicate SendSoapOption — pin the behaviour so
+// the next maintainer adding an option doesn't accidentally introduce
+// a merge or first-wins semantic.
+func TestDevice_SendSoapWithOptions_DuplicateWithSOAPHeaderLastWins(t *testing.T) {
+	var captured string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		captured = string(b)
+	}))
+	t.Cleanup(srv.Close)
+
+	dev := Device{params: DeviceParams{HttpClient: srv.Client()}}
+	_, err := dev.SendSoapWithOptions(srv.URL, "<body/>",
+		WithSOAPHeader(`<a:First xmlns:a="x"/>`),
+		WithSOAPHeader(`<b:Second xmlns:b="y"/>`),
+	)
+	require.NoError(t, err)
+	assert.NotContains(t, captured, "First", "first WithSOAPHeader must be overwritten")
+	assert.Contains(t, captured, "Second")
 }

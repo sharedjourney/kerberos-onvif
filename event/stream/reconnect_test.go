@@ -13,7 +13,9 @@ import (
 
 // createPullPointRespAlt mirrors the first fixture but returns a
 // different SubscriptionReference Address so a test can prove that
-// subsequent pulls hit the recreated endpoint.
+// subsequent pulls hit the recreated endpoint. Like createPullPointResp,
+// it intentionally omits <TerminationTime> so renew scheduling stays
+// driven by opts.
 const createPullPointRespAlt = `<?xml version="1.0" encoding="UTF-8"?>
 <env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope"
               xmlns:wsa="http://www.w3.org/2005/08/addressing"

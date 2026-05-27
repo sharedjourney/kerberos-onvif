@@ -165,8 +165,9 @@ type Stream struct {
 	caller caller
 	opts   Options
 
-	pullPointMu sync.Mutex
-	pullPoint   subscriptionRef
+	pullPointMu  sync.Mutex
+	pullPoint    subscriptionRef
+	gen uint64 // bumped on every setPullPoint so renews can detect a recreate
 
 	events chan Event
 	errors chan error
@@ -191,11 +192,29 @@ func (s *Stream) setPullPoint(ref subscriptionRef) {
 	s.pullPointMu.Lock()
 	defer s.pullPointMu.Unlock()
 	s.pullPoint = ref
+	s.gen++
 }
 
-func (s *Stream) updateGrantedTermination(t time.Time) {
+// pullPointGen returns the current generation. Pair with
+// updateGrantedTerminationIfGen so a renew result issued against a
+// subscription that was rotated mid-flight (recreate path) is
+// discarded instead of overwriting the new subscription's grant.
+func (s *Stream) pullPointGen() uint64 {
 	s.pullPointMu.Lock()
 	defer s.pullPointMu.Unlock()
+	return s.gen
+}
+
+// updateGrantedTerminationIfGen writes the granted time only when the
+// caller's snapshot is still current. Use setPullPoint to replace the
+// full ref; this updates GrantedTermination in place after a renew
+// response.
+func (s *Stream) updateGrantedTerminationIfGen(gen uint64, t time.Time) {
+	s.pullPointMu.Lock()
+	defer s.pullPointMu.Unlock()
+	if s.gen != gen {
+		return
+	}
 	s.pullPoint.GrantedTermination = t
 }
 

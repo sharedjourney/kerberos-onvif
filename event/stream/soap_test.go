@@ -315,7 +315,7 @@ func TestCreatePullPoint_VendorWithoutRefParams_RefParamsEmpty(t *testing.T) {
 func TestPullMessages_EchoesRefParamsWithIsReferenceParameterAttribute(t *testing.T) {
 	ref := subscriptionRef{
 		Address:      "http://192.168.1.10/onvif/services",
-		RefParamsXML: `<dom0:SubscriptionId xmlns:dom0="http://www.axis.com/2009/event">297</dom0:SubscriptionId>`,
+		RefParamsXML: `<wsa:ReferenceParameters xmlns:wsa="http://www.w3.org/2005/08/addressing"><dom0:SubscriptionId xmlns:dom0="http://www.axis.com/2009/event">297</dom0:SubscriptionId></wsa:ReferenceParameters>`,
 	}
 	fc := newFakeCaller()
 	_, err := pullMessages(fc, ref, defaultOptions())
@@ -349,7 +349,9 @@ func TestPullMessages_PostsToAddressFromRef(t *testing.T) {
 // --- Building the header XML from raw ref params ----------------------
 
 func TestBuildRefParamsHeader_AddsIsReferenceParameter(t *testing.T) {
-	raw := `<dom0:SubscriptionId xmlns:dom0="http://www.axis.com/2009/event">297</dom0:SubscriptionId>`
+	raw := `<wsa:ReferenceParameters xmlns:wsa="http://www.w3.org/2005/08/addressing">` +
+		`<dom0:SubscriptionId xmlns:dom0="http://www.axis.com/2009/event">297</dom0:SubscriptionId>` +
+		`</wsa:ReferenceParameters>`
 	got, err := buildRefParamsHeader(raw)
 	require.NoError(t, err)
 	assert.Contains(t, got, "SubscriptionId")
@@ -360,7 +362,9 @@ func TestBuildRefParamsHeader_AddsIsReferenceParameter(t *testing.T) {
 }
 
 func TestBuildRefParamsHeader_MultipleTopLevelChildren(t *testing.T) {
-	raw := `<a:Foo xmlns:a="ns/a">1</a:Foo><b:Bar xmlns:b="ns/b">2</b:Bar>`
+	raw := `<wsa:ReferenceParameters xmlns:wsa="http://www.w3.org/2005/08/addressing">` +
+		`<a:Foo xmlns:a="ns/a">1</a:Foo><b:Bar xmlns:b="ns/b">2</b:Bar>` +
+		`</wsa:ReferenceParameters>`
 	got, err := buildRefParamsHeader(raw)
 	require.NoError(t, err)
 	assert.Equal(t, 2, strings.Count(got, `IsReferenceParameter="true"`),
@@ -378,7 +382,7 @@ func TestBuildRefParamsHeader_EmptyInputReturnsEmpty(t *testing.T) {
 func TestUnsubscribePullPoint_EchoesRefParamsWithIsReferenceParameter(t *testing.T) {
 	ref := subscriptionRef{
 		Address:      "http://192.168.1.10/onvif/services",
-		RefParamsXML: `<dom0:SubscriptionId xmlns:dom0="http://www.axis.com/2009/event">297</dom0:SubscriptionId>`,
+		RefParamsXML: `<wsa:ReferenceParameters xmlns:wsa="http://www.w3.org/2005/08/addressing"><dom0:SubscriptionId xmlns:dom0="http://www.axis.com/2009/event">297</dom0:SubscriptionId></wsa:ReferenceParameters>`,
 	}
 	fc := newFakeCaller()
 	require.NoError(t, unsubscribePullPoint(fc, ref))
@@ -401,8 +405,10 @@ func TestUnsubscribePullPoint_EmptyAddressIsNoOp(t *testing.T) {
 func TestPullMessages_TwoRefParamsEachLandsOnTheWire(t *testing.T) {
 	ref := subscriptionRef{
 		Address: "http://camera/sub",
-		RefParamsXML: `<a:Foo xmlns:a="ns/a">1</a:Foo>` +
-			`<b:Bar xmlns:b="ns/b">2</b:Bar>`,
+		RefParamsXML: `<wsa:ReferenceParameters xmlns:wsa="http://www.w3.org/2005/08/addressing">` +
+			`<a:Foo xmlns:a="ns/a">1</a:Foo>` +
+			`<b:Bar xmlns:b="ns/b">2</b:Bar>` +
+			`</wsa:ReferenceParameters>`,
 	}
 	fc := newFakeCaller()
 	_, err := pullMessages(fc, ref, defaultOptions())
@@ -600,4 +606,77 @@ func TestBuildRefParamsHeader_WhitespaceOnlyReturnsEmpty(t *testing.T) {
 	got, err := buildRefParamsHeader("   \n\t ")
 	require.NoError(t, err)
 	assert.Empty(t, got)
+}
+
+// Worst case: the response body's <Security> block starts within the
+// 64 KiB error cap but its </Security> is past it. The non-greedy
+// regex needs a close tag — without one the redaction misses and
+// raw Username/Password reaches the excerpt. Verify the helper
+// strips from <Security to EOF when no close tag is present.
+func TestEnrichSOAPErr_RedactsSecurityBlockMissingCloseTag(t *testing.T) {
+	body := `<env:Envelope xmlns:env="x"><env:Header>` +
+		`<wsse:Security xmlns:wsse="y">` +
+		`<wsse:Username>admin</wsse:Username>` +
+		`<wsse:Password>hunter2</wsse:Password>` +
+		// no </wsse:Security> — simulates a Security block truncated
+		// at the 64 KiB read cap.
+		strings.Repeat("padding ", 1000)
+	got := enrichSOAPErr(fakeResponse(body), errors.New("500"))
+	require.Error(t, got)
+	assert.NotContains(t, got.Error(), "hunter2",
+		"truncated Security block must not leak Password to the excerpt")
+	assert.NotContains(t, got.Error(), "admin",
+		"truncated Security block must not leak Username to the excerpt")
+}
+
+// The wrapper-only contract means an element whose local name merely
+// ends in "ReferenceParameters" cannot be mistaken for the wrapper —
+// the root must be exactly <*:ReferenceParameters>. Anything else is
+// a contract violation by the caller and surfaces as an error.
+func TestBuildRefParamsHeader_RejectsNonReferenceParametersRoot(t *testing.T) {
+	raw := `<my:MyReferenceParameters xmlns:my="urn:vendor:my">X</my:MyReferenceParameters>`
+	_, err := buildRefParamsHeader(raw)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "ReferenceParameters")
+}
+
+// A non-conformant camera echoing UsernameToken/Password outside a
+// <Security> wrapper would still leak credentials through the body
+// excerpt. Belt-and-braces: redact Password elements directly too.
+func TestEnrichSOAPErr_RedactsBarePasswordElement(t *testing.T) {
+	body := `<env:Envelope xmlns:env="x"><env:Body>` +
+		`<wsse:UsernameToken xmlns:wsse="y">` +
+		`<wsse:Username>admin</wsse:Username>` +
+		`<wsse:Password>hunter2</wsse:Password>` +
+		`</wsse:UsernameToken>` +
+		`</env:Body></env:Envelope>`
+	got := enrichSOAPErr(fakeResponse(body), errors.New("400"))
+	require.Error(t, got)
+	assert.NotContains(t, got.Error(), "hunter2",
+		"Password must be redacted regardless of whether it's wrapped in Security")
+}
+
+// --- Edge-case coverage flagged in review -----------------------------
+
+func TestExtractTerminationTime_MalformedDateYieldsZero(t *testing.T) {
+	body := `<env:Body><wsnt:TerminationTime>not-a-date</wsnt:TerminationTime></env:Body>`
+	assert.True(t, extractTerminationTime(body).IsZero(),
+		"unparseable datetime must not panic and must not return a garbage time — fall back to opts")
+}
+
+func TestNextRenewInterval_MarginEqualsBaseFallsToHalf(t *testing.T) {
+	now := time.Date(2026, 5, 27, 13, 0, 0, 0, time.UTC)
+	opts := Options{InitialTermination: 30 * time.Second, RenewMargin: 30 * time.Second}
+	got := nextRenewInterval(time.Time{}, opts, now)
+	assert.Equal(t, 15*time.Second, got,
+		"when margin == base, the helper must fall through to base/2 rather than the 1s floor")
+}
+
+func TestExtractReferenceParameters_EmptySubscriptionReferenceReturnsEmpty(t *testing.T) {
+	body := `<env:Envelope xmlns:env="x" xmlns:tev="y">
+  <env:Body><tev:CreatePullPointSubscriptionResponse>
+    <tev:SubscriptionReference/>
+  </tev:CreatePullPointSubscriptionResponse></env:Body>
+</env:Envelope>`
+	assert.Empty(t, extractReferenceParameters(body))
 }

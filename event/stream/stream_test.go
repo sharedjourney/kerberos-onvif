@@ -33,6 +33,7 @@ type fakeCaller struct {
 	defaultCall      fakeResp
 	callMethodCalls  []any
 	sendSoapCalls    [][2]string
+	sendSoapHeaders  []string
 	blockUnsubscribe chan struct{}
 	blockAllSendSoap chan struct{}
 }
@@ -102,6 +103,16 @@ func (f *fakeCaller) SendSoap(endpoint, body string) (*http.Response, error) {
 		return nil, r.err
 	}
 	return &http.Response{Body: io.NopCloser(strings.NewReader(r.body))}, r.err
+}
+
+// SendSoapWithHeader delegates body+endpoint recording to SendSoap so
+// existing assertions on sendSoapCalls keep working, and records the
+// header XML in a parallel slice for ref-params wiring tests.
+func (f *fakeCaller) SendSoapWithHeader(endpoint, body, headerXML string) (*http.Response, error) {
+	f.mu.Lock()
+	f.sendSoapHeaders = append(f.sendSoapHeaders, headerXML)
+	f.mu.Unlock()
+	return f.SendSoap(endpoint, body)
 }
 
 func (f *fakeCaller) sendSoapCallCount() int {

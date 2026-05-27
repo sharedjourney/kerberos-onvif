@@ -110,6 +110,17 @@ func (o Options) withDefaults() Options {
 	return d
 }
 
+// subscriptionRef holds the result of CreatePullPointSubscription.
+// AXIS encodes the subscription identity in RefParamsXML (a generic
+// /onvif/services Address plus a <wsa:ReferenceParameters> child);
+// other vendors put the identity in the Address itself, leaving
+// RefParamsXML empty. Subscription-scoped requests must echo a
+// non-empty RefParamsXML — see extractReferenceParameters.
+type subscriptionRef struct {
+	Address      string
+	RefParamsXML string
+}
+
 // caller is the *onvif.Device subset Stream depends on. Implementations
 // must:
 //
@@ -125,6 +136,7 @@ func (o Options) withDefaults() Options {
 type caller interface {
 	CallMethod(method any) (*http.Response, error)
 	SendSoap(endpoint, body string) (*http.Response, error)
+	SendSoapWithHeader(endpoint, body, headerXML string) (*http.Response, error)
 }
 
 type deviceCaller struct{ dev *onvif.Device }
@@ -137,6 +149,10 @@ func (d deviceCaller) SendSoap(endpoint, body string) (*http.Response, error) {
 	return d.dev.SendSoap(endpoint, body)
 }
 
+func (d deviceCaller) SendSoapWithHeader(endpoint, body, headerXML string) (*http.Response, error) {
+	return d.dev.SendSoapWithHeader(endpoint, body, headerXML)
+}
+
 // Stream owns a single ONVIF pull-point subscription. Safe for Close
 // from any goroutine while readers consume Events / Errors. Close is
 // idempotent.
@@ -145,7 +161,7 @@ type Stream struct {
 	opts   Options
 
 	pullPointMu sync.Mutex
-	pullPoint   string
+	pullPoint   subscriptionRef
 
 	events chan Event
 	errors chan error
@@ -160,16 +176,16 @@ type Stream struct {
 	now func() time.Time
 }
 
-func (s *Stream) getPullPoint() string {
+func (s *Stream) getPullPoint() subscriptionRef {
 	s.pullPointMu.Lock()
 	defer s.pullPointMu.Unlock()
 	return s.pullPoint
 }
 
-func (s *Stream) setPullPoint(addr string) {
+func (s *Stream) setPullPoint(ref subscriptionRef) {
 	s.pullPointMu.Lock()
 	defer s.pullPointMu.Unlock()
-	s.pullPoint = addr
+	s.pullPoint = ref
 }
 
 // NewStream creates a Stream and performs CreatePullPointSubscription
@@ -183,7 +199,7 @@ func NewStream(ctx context.Context, dev *onvif.Device, opts Options) (*Stream, e
 
 func newStream(ctx context.Context, c caller, opts Options) (*Stream, error) {
 	opts = opts.withDefaults()
-	addr, err := createPullPoint(c, opts)
+	ref, err := createPullPoint(c, opts)
 	if err != nil {
 		return nil, fmt.Errorf("create pull point subscription: %w", err)
 	}
@@ -191,7 +207,7 @@ func newStream(ctx context.Context, c caller, opts Options) (*Stream, error) {
 	s := &Stream{
 		caller:    c,
 		opts:      opts,
-		pullPoint: addr,
+		pullPoint: ref,
 		events:    make(chan Event, opts.BufferSize),
 		errors:    make(chan error, opts.BufferSize),
 		cancel:    cancel,

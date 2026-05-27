@@ -42,14 +42,18 @@ func (s *Stream) renewLoop(ctx context.Context) {
 // WS-BaseNotification §6.1.1 also allows xsd:duration but older
 // Hikvision, some Dahua and some Bosch firmwares reject the
 // relative form.
-func renewPullPoint(c caller, endpoint string, opts Options) error {
+func renewPullPoint(c caller, ref subscriptionRef, opts Options) error {
 	absoluteEnd := time.Now().UTC().Add(opts.InitialTermination).Format("2006-01-02T15:04:05Z")
 	req := event.Renew{TerminationTime: xsd.String(absoluteEnd)}
 	body, err := xml.Marshal(req)
 	if err != nil {
 		return fmt.Errorf("marshal Renew: %w", err)
 	}
-	resp, err := c.SendSoap(endpoint, string(body))
+	headerXML, err := buildRefParamsHeader(ref.RefParamsXML)
+	if err != nil {
+		return fmt.Errorf("build ref params header: %w", err)
+	}
+	resp, err := c.SendSoapWithHeader(ref.Address, string(body), headerXML)
 	if err != nil {
 		return enrichSOAPErr(resp, err)
 	}

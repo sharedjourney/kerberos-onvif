@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/beevik/etree"
 	"github.com/kerberos-io/onvif/event"
 	"github.com/kerberos-io/onvif/xsd"
 )
@@ -22,7 +23,7 @@ import (
 // hostile or buggy camera from OOMing the process.
 const maxResponseBytes = 10 << 20
 
-func createPullPoint(c caller, opts Options) (string, error) {
+func createPullPoint(c caller, opts Options) (subscriptionRef, error) {
 	term := xsd.String(durationToXSD(opts.InitialTermination))
 	req := event.CreatePullPointSubscription{InitialTerminationTime: &term}
 	if opts.RawTopicFilter != "" {
@@ -35,26 +36,26 @@ func createPullPoint(c caller, opts Options) (string, error) {
 	}
 	resp, err := c.CallMethod(req)
 	if err != nil {
-		return "", enrichSOAPErr(resp, err)
+		return subscriptionRef{}, enrichSOAPErr(resp, err)
 	}
 	body, err := readClose(resp)
 	if err != nil {
-		return "", err
+		return subscriptionRef{}, err
 	}
 	var decoded event.CreatePullPointSubscriptionResponse
 	if err := unmarshalNode(body, "CreatePullPointSubscriptionResponse", &decoded); err != nil {
-		return "", err
+		return subscriptionRef{}, err
 	}
 	addr := string(decoded.SubscriptionReference.Address)
 	if addr == "" {
-		return "", errors.New("CreatePullPointSubscription response has empty SubscriptionReference Address")
+		return subscriptionRef{}, errors.New("CreatePullPointSubscription response has empty SubscriptionReference Address")
 	}
-	return addr, nil
+	return subscriptionRef{Address: addr, RefParamsXML: extractReferenceParameters(body)}, nil
 }
 
 // pullMessages returns an empty slice (no error) when the camera had
 // nothing within PullTimeout.
-func pullMessages(c caller, endpoint string, opts Options) ([]event.NotificationMessage, error) {
+func pullMessages(c caller, ref subscriptionRef, opts Options) ([]event.NotificationMessage, error) {
 	req := event.PullMessages{
 		Timeout:      xsd.Duration(durationToXSD(opts.PullTimeout)),
 		MessageLimit: xsd.Int(opts.MessageLimit),
@@ -63,7 +64,11 @@ func pullMessages(c caller, endpoint string, opts Options) ([]event.Notification
 	if err != nil {
 		return nil, fmt.Errorf("marshal PullMessages: %w", err)
 	}
-	resp, err := c.SendSoap(endpoint, string(body))
+	headerXML, err := buildRefParamsHeader(ref.RefParamsXML)
+	if err != nil {
+		return nil, fmt.Errorf("build ref params header: %w", err)
+	}
+	resp, err := c.SendSoapWithHeader(ref.Address, string(body), headerXML)
 	if err != nil {
 		return nil, enrichSOAPErr(resp, err)
 	}
@@ -78,17 +83,21 @@ func pullMessages(c caller, endpoint string, opts Options) ([]event.Notification
 	return decoded.NotificationMessage, nil
 }
 
-// unsubscribePullPoint is best-effort. Empty endpoint is a no-op
-// (construction failed before installing one).
-func unsubscribePullPoint(c caller, endpoint string) error {
-	if endpoint == "" {
+// unsubscribePullPoint is best-effort. Empty Address is a no-op
+// (construction failed before installing a subscription).
+func unsubscribePullPoint(c caller, ref subscriptionRef) error {
+	if ref.Address == "" {
 		return nil
 	}
 	body, err := xml.Marshal(event.Unsubscribe{})
 	if err != nil {
 		return fmt.Errorf("marshal Unsubscribe: %w", err)
 	}
-	resp, err := c.SendSoap(endpoint, string(body))
+	headerXML, err := buildRefParamsHeader(ref.RefParamsXML)
+	if err != nil {
+		return fmt.Errorf("build ref params header: %w", err)
+	}
+	resp, err := c.SendSoapWithHeader(ref.Address, string(body), headerXML)
 	if err != nil {
 		return enrichSOAPErr(resp, err)
 	}
@@ -166,6 +175,51 @@ func extractSOAPFault(body string) string {
 		return strings.TrimSpace(m[1])
 	}
 	return ""
+}
+
+var refParamsRE = regexp.MustCompile(`(?s)<(?:[^:>\s]+:)?ReferenceParameters\b[^>]*>(.*?)</(?:[^:>\s]+:)?ReferenceParameters>`)
+
+// buildRefParamsHeader produces the SOAP <Header> inner XML for a set
+// of WS-Addressing ReferenceParameters: each top-level child element
+// is re-emitted with wsa:IsReferenceParameter="true" added, as the
+// spec requires. Empty input yields empty output (no-op for vendors
+// that encode subscription identity in the URL).
+func buildRefParamsHeader(rawXML string) (string, error) {
+	if strings.TrimSpace(rawXML) == "" {
+		return "", nil
+	}
+	doc := etree.NewDocument()
+	if err := doc.ReadFromString("<wrap>" + rawXML + "</wrap>"); err != nil {
+		return "", fmt.Errorf("parse ref params: %w", err)
+	}
+	wrap := doc.SelectElement("wrap")
+	if wrap == nil {
+		return "", errors.New("parse ref params: missing wrap root")
+	}
+	var out strings.Builder
+	for _, child := range wrap.ChildElements() {
+		child.CreateAttr("wsa:IsReferenceParameter", "true")
+		d := etree.NewDocument()
+		d.SetRoot(child.Copy())
+		s, err := d.WriteToString()
+		if err != nil {
+			return "", fmt.Errorf("serialise ref param child: %w", err)
+		}
+		out.WriteString(strings.TrimRight(s, "\n"))
+	}
+	return out.String(), nil
+}
+
+// extractReferenceParameters returns the verbatim inner XML so callers
+// can echo it (with wsa:IsReferenceParameter="true") into the SOAP
+// Header of subscription-scoped requests per WS-Addressing 1.0 §3.1.
+// Without that echo, AXIS rejects PullMessages with ter:InvalidArgs.
+func extractReferenceParameters(body string) string {
+	m := refParamsRE.FindStringSubmatch(body)
+	if len(m) < 2 {
+		return ""
+	}
+	return strings.TrimSpace(m[1])
 }
 
 // extractSOAPSubcode is the fallback when Reason/Text is empty — AXIS

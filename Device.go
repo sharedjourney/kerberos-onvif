@@ -335,26 +335,32 @@ func (dev *Device) GetEndpointByRequestStruct(requestStruct interface{}) (string
 
 // CallMethod functions call an method, defined <method> struct with authentication data
 func (dev Device) SendSoap(endpoint string, xmlRequestBody string) (*http.Response, error) {
+	return dev.SendSoapWithHeader(endpoint, xmlRequestBody, "")
+}
 
+// SendSoapWithHeader is SendSoap plus arbitrary inner-Header XML —
+// needed to echo WS-Addressing ReferenceParameters (with
+// wsa:IsReferenceParameter="true") back to vendors like AXIS that
+// identify pull-point subscriptions through them rather than the URL.
+func (dev Device) SendSoapWithHeader(endpoint, xmlRequestBody, xmlHeaderContent string) (*http.Response, error) {
 	soap := gosoap.NewEmptySOAP()
 	soap.AddStringBodyContent(xmlRequestBody)
 	soap.AddRootNamespaces(Xlmns)
 	soap.AddAction()
-
-	//Auth Handling
+	if xmlHeaderContent != "" {
+		_ = soap.AddStringHeaderContent(xmlHeaderContent)
+	}
 	if dev.params.Username != "" && dev.params.Password != "" {
 		soap.AddWSSecurity(dev.params.Username, dev.params.Password)
 	}
 
 	servResp, err := networking.SendSoap(dev.params.HttpClient, endpoint, soap.String())
 	if err != nil {
-		// Close server response body to reuse the connection
 		if servResp != nil {
 			servResp.Body.Close()
 		}
 		servResp, err = networking.SendSoapWithDigest(dev.params.HttpClient, endpoint, soap.String(), dev.params.Username, dev.params.Password)
 	}
-
 	return servResp, err
 }
 

@@ -103,6 +103,49 @@ func TestDevice_SendSoapWithHeader_AcceptsMultipleTopLevelChildren(t *testing.T)
 	assert.Contains(t, headerSlice, "Bar")
 }
 
+// SendSoapWithOptions is the variadic shape that future per-call
+// options (timeout, context, ...) will hang off. SendSoap and
+// SendSoapWithHeader stay as thin convenience wrappers so existing
+// callers are not forced to migrate.
+func TestDevice_SendSoapWithOptions_WithHeaderMatchesSendSoapWithHeader(t *testing.T) {
+	const headerXML = `<dom0:SubscriptionId xmlns:dom0="urn:test">42</dom0:SubscriptionId>`
+	const bodyXML = `<tev:PullMessages xmlns:tev="http://www.onvif.org/ver10/events/wsdl"/>`
+
+	var captured string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		captured = string(b)
+	}))
+	t.Cleanup(srv.Close)
+
+	dev := Device{params: DeviceParams{HttpClient: srv.Client()}}
+	resp, err := dev.SendSoapWithOptions(srv.URL, bodyXML, WithHeader(headerXML))
+	require.NoError(t, err)
+	if resp != nil && resp.Body != nil {
+		resp.Body.Close()
+	}
+	assert.Contains(t, captured, "SubscriptionId")
+	assert.Contains(t, captured, "42")
+}
+
+func TestDevice_SendSoapWithOptions_NoOptsMatchesSendSoap(t *testing.T) {
+	var captured string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		captured = string(b)
+	}))
+	t.Cleanup(srv.Close)
+
+	dev := Device{params: DeviceParams{HttpClient: srv.Client()}}
+	resp, err := dev.SendSoapWithOptions(srv.URL, `<tev:Body xmlns:tev="x"/>`)
+	require.NoError(t, err)
+	if resp != nil && resp.Body != nil {
+		resp.Body.Close()
+	}
+	assert.NotContains(t, captured, "IsReferenceParameter",
+		"no opts should produce a header-less envelope")
+}
+
 // Digest auth fallback path: the camera 401s the first POST and the
 // retry computes a digest. The ref-params header must survive the
 // retry — losing it would silently re-introduce the AXIS regression

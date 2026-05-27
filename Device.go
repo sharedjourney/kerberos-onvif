@@ -335,7 +335,7 @@ func (dev *Device) GetEndpointByRequestStruct(requestStruct interface{}) (string
 
 // SendSoap POSTs the given body wrapped in a SOAP envelope.
 func (dev Device) SendSoap(endpoint string, xmlRequestBody string) (*http.Response, error) {
-	return dev.SendSoapWithHeader(endpoint, xmlRequestBody, "")
+	return dev.SendSoapWithOptions(endpoint, xmlRequestBody)
 }
 
 // SendSoapWithHeader is SendSoap plus arbitrary inner-Header XML —
@@ -350,11 +350,38 @@ func (dev Device) SendSoap(endpoint string, xmlRequestBody string) (*http.Respon
 // sourced data inside it. Malformed XML returns an error before any
 // request is made.
 func (dev Device) SendSoapWithHeader(endpoint, xmlRequestBody, xmlHeaderContent string) (*http.Response, error) {
+	return dev.SendSoapWithOptions(endpoint, xmlRequestBody, WithHeader(xmlHeaderContent))
+}
+
+// SoapOption tweaks a single SendSoapWithOptions call. New options
+// (per-call timeout, context, custom envelope namespaces, ...) should
+// be added as WithX constructors here rather than as new method
+// variants on Device.
+type SoapOption func(*soapConfig)
+
+type soapConfig struct {
+	headerContent string
+}
+
+// WithHeader adds inner-Header XML to the envelope. See
+// SendSoapWithHeader for the content contract.
+func WithHeader(xml string) SoapOption {
+	return func(c *soapConfig) { c.headerContent = xml }
+}
+
+// SendSoapWithOptions is the workhorse behind SendSoap and
+// SendSoapWithHeader; call it directly when you need to combine
+// options or pass options not surfaced by the convenience wrappers.
+func (dev Device) SendSoapWithOptions(endpoint, xmlRequestBody string, opts ...SoapOption) (*http.Response, error) {
+	var cfg soapConfig
+	for _, o := range opts {
+		o(&cfg)
+	}
 	soap := gosoap.NewEmptySOAP()
 	soap.AddStringBodyContent(xmlRequestBody)
 	soap.AddRootNamespaces(Xlmns)
 	soap.AddAction()
-	if err := addHeaderChildren(&soap, xmlHeaderContent); err != nil {
+	if err := addHeaderChildren(&soap, cfg.headerContent); err != nil {
 		return nil, err
 	}
 	if dev.params.Username != "" && dev.params.Password != "" {

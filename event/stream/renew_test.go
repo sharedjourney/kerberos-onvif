@@ -2,6 +2,7 @@ package stream
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -168,3 +169,21 @@ func TestRenew_SendsAbsoluteDateTimeNotDuration(t *testing.T) {
 	assert.NotContains(t, renewBody, "PT", "Renew should not send relative duration; some firmwares reject it")
 	assert.Regexp(t, `\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z`, renewBody, "Renew should send absolute RFC3339 UTC")
 }
+
+// --- Wiring: renew surfaces SOAP fault detail -------------------------
+
+func TestRenewPullPoint_EnrichesTransportErrWithFaultReason(t *testing.T) {
+	fc := newFakeCaller()
+	fc.queueSendSoap(renewFaultBody, errors.New("400 Bad Request"))
+	err := renewPullPoint(fc, "http://camera/sub", defaultOptions())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "renew-specific complaint",
+		"renewPullPoint must enrich transport errors with the camera's SOAP fault")
+}
+
+const renewFaultBody = `<env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope">
+  <env:Body><env:Fault>
+    <env:Code><env:Value>env:Sender</env:Value></env:Code>
+    <env:Reason><env:Text xml:lang="en">renew-specific complaint</env:Text></env:Reason>
+  </env:Fault></env:Body>
+</env:Envelope>`

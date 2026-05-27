@@ -71,10 +71,12 @@ func (f *fakeCaller) CallMethod(m any) (*http.Response, error) {
 		r = f.callMethodResps[0]
 		f.callMethodResps = f.callMethodResps[1:]
 	}
-	if r.err != nil {
+	// Mirror networking.SendSoap*: a 4xx/5xx returns body alongside
+	// err. Tests opt into that shape by queueing body + err together.
+	if r.err != nil && r.body == "" {
 		return nil, r.err
 	}
-	return &http.Response{Body: io.NopCloser(strings.NewReader(r.body))}, nil
+	return &http.Response{Body: io.NopCloser(strings.NewReader(r.body))}, r.err
 }
 
 func (f *fakeCaller) SendSoap(endpoint, body string) (*http.Response, error) {
@@ -96,10 +98,10 @@ func (f *fakeCaller) SendSoap(endpoint, body string) (*http.Response, error) {
 		<-block
 	}
 
-	if r.err != nil {
+	if r.err != nil && r.body == "" {
 		return nil, r.err
 	}
-	return &http.Response{Body: io.NopCloser(strings.NewReader(r.body))}, nil
+	return &http.Response{Body: io.NopCloser(strings.NewReader(r.body))}, r.err
 }
 
 func (f *fakeCaller) sendSoapCallCount() int {

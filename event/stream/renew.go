@@ -51,7 +51,7 @@ func renewPullPoint(c caller, endpoint string, opts Options) error {
 	}
 	resp, err := c.SendSoap(endpoint, string(body))
 	if err != nil {
-		return err
+		return enrichSOAPErr(resp, err)
 	}
 	_, err = readClose(resp)
 	return err

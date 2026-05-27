@@ -35,7 +35,7 @@ func createPullPoint(c caller, opts Options) (string, error) {
 	}
 	resp, err := c.CallMethod(req)
 	if err != nil {
-		return "", err
+		return "", enrichSOAPErr(resp, err)
 	}
 	body, err := readClose(resp)
 	if err != nil {
@@ -65,7 +65,7 @@ func pullMessages(c caller, endpoint string, opts Options) ([]event.Notification
 	}
 	resp, err := c.SendSoap(endpoint, string(body))
 	if err != nil {
-		return nil, err
+		return nil, enrichSOAPErr(resp, err)
 	}
 	respBody, err := readClose(resp)
 	if err != nil {
@@ -90,7 +90,7 @@ func unsubscribePullPoint(c caller, endpoint string) error {
 	}
 	resp, err := c.SendSoap(endpoint, string(body))
 	if err != nil {
-		return err
+		return enrichSOAPErr(resp, err)
 	}
 	_, err = readClose(resp)
 	return err
@@ -148,6 +148,8 @@ var (
 	soap11FaultRE = regexp.MustCompile(`(?s)<(?:[^:>\s]+:)?faultstring[^>]*>(.*?)</(?:[^:>\s]+:)?faultstring>`)
 	// SOAP 1.2: <Fault>...<Reason><Text>reason</Text></Reason>...</Fault>
 	soap12FaultRE = regexp.MustCompile(`(?s)<(?:[^:>\s]+:)?Reason\b[^>]*>.*?<(?:[^:>\s]+:)?Text[^>]*>(.*?)</(?:[^:>\s]+:)?Text>`)
+	// SOAP 1.2 Subcode: <Code>...<Subcode><Value>ter:InvalidArgs</Value></Subcode>...
+	soap12SubcodeRE = regexp.MustCompile(`(?s)<(?:[^:>\s]+:)?Subcode\b[^>]*>.*?<(?:[^:>\s]+:)?Value[^>]*>(.*?)</(?:[^:>\s]+:)?Value>`)
 )
 
 // extractSOAPFault returns the reason text from a SOAP fault or empty
@@ -164,6 +166,53 @@ func extractSOAPFault(body string) string {
 		return strings.TrimSpace(m[1])
 	}
 	return ""
+}
+
+// extractSOAPSubcode is the fallback when Reason/Text is empty — AXIS
+// routinely sends an empty <Text/> alongside a populated Subcode
+// (e.g. "ter:InvalidArgs"), and that subcode is the only actionable
+// signal the operator gets.
+func extractSOAPSubcode(body string) string {
+	m := soap12SubcodeRE.FindStringSubmatch(body)
+	if len(m) > 1 {
+		return strings.TrimSpace(m[1])
+	}
+	return ""
+}
+
+// maxErrExcerpt caps the body excerpt appended to an enriched error so
+// a wedged camera streaming a multi-megabyte HTML error page can not
+// flood logs with every retry.
+const maxErrExcerpt = 512
+
+// enrichSOAPErr appends the camera's actual complaint (SOAP Fault
+// reason, then Subcode, then raw body excerpt) to a transport error so
+// operators see *why* the camera said 400 instead of just "400 Bad
+// Request". The original err is preserved via %w for errors.Is/As.
+func enrichSOAPErr(resp *http.Response, err error) error {
+	if err == nil {
+		return nil
+	}
+	if resp == nil || resp.Body == nil {
+		return err
+	}
+	defer resp.Body.Close()
+	b, readErr := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	if readErr != nil || len(b) == 0 {
+		return err
+	}
+	body := string(b)
+	if reason := extractSOAPFault(body); reason != "" {
+		return fmt.Errorf("%w: SOAP fault: %s", err, reason)
+	}
+	if sub := extractSOAPSubcode(body); sub != "" {
+		return fmt.Errorf("%w: SOAP fault subcode: %s", err, sub)
+	}
+	excerpt := strings.TrimSpace(body)
+	if len(excerpt) > maxErrExcerpt {
+		excerpt = excerpt[:maxErrExcerpt] + "...(truncated)"
+	}
+	return fmt.Errorf("%w: response body: %s", err, excerpt)
 }
 
 // durationToXSD formats a duration as xsd:duration PTnS. Second

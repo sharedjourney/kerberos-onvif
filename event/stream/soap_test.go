@@ -2,6 +2,9 @@ package stream
 
 import (
 	"context"
+	"errors"
+	"io"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -83,4 +86,141 @@ func testContext(t *testing.T) context.Context {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	return ctx
+}
+
+// --- Error enrichment from SOAP response bodies ----------------------
+
+func fakeResponse(body string) *http.Response {
+	return &http.Response{
+		StatusCode: http.StatusBadRequest,
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+}
+
+func TestEnrichSOAPErr_NilErrReturnsNil(t *testing.T) {
+	assert.NoError(t, enrichSOAPErr(fakeResponse("anything"), nil))
+}
+
+func TestEnrichSOAPErr_NilRespPreservesOriginal(t *testing.T) {
+	orig := errors.New("transport boom")
+	got := enrichSOAPErr(nil, orig)
+	assert.ErrorIs(t, got, orig)
+	assert.Equal(t, orig.Error(), got.Error(), "no body, no extra context to add")
+}
+
+func TestEnrichSOAPErr_SOAP11FaultStringAppearsInError(t *testing.T) {
+	body := `<env:Envelope xmlns:env="http://schemas.xmlsoap.org/soap/envelope/">
+  <env:Body><env:Fault><faultstring>not authorized</faultstring></env:Fault></env:Body>
+</env:Envelope>`
+	got := enrichSOAPErr(fakeResponse(body), errors.New("400 Bad Request"))
+	require.Error(t, got)
+	assert.Contains(t, got.Error(), "400 Bad Request")
+	assert.Contains(t, got.Error(), "not authorized")
+}
+
+func TestEnrichSOAPErr_SOAP12ReasonAppearsInError(t *testing.T) {
+	body := `<env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope">
+  <env:Body><env:Fault>
+    <env:Code><env:Value>env:Sender</env:Value></env:Code>
+    <env:Reason><env:Text xml:lang="en">Subscription has expired</env:Text></env:Reason>
+  </env:Fault></env:Body>
+</env:Envelope>`
+	got := enrichSOAPErr(fakeResponse(body), errors.New("400 Bad Request"))
+	require.Error(t, got)
+	assert.Contains(t, got.Error(), "Subscription has expired")
+}
+
+// Pins the AXIS case: a Fault with populated Subcode but an empty
+// <Reason><Text/></Reason>. Without subcode fallback, the only signal
+// the operator sees is "400 Bad Request".
+func TestEnrichSOAPErr_EmptyReasonFallsBackToSubcode(t *testing.T) {
+	body := `<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope" xmlns:ter="http://www.onvif.org/ver10/error">
+  <SOAP-ENV:Body><SOAP-ENV:Fault>
+    <SOAP-ENV:Code>
+      <SOAP-ENV:Value>SOAP-ENV:Sender</SOAP-ENV:Value>
+      <SOAP-ENV:Subcode><SOAP-ENV:Value>ter:InvalidArgs</SOAP-ENV:Value></SOAP-ENV:Subcode>
+    </SOAP-ENV:Code>
+    <SOAP-ENV:Reason><SOAP-ENV:Text xml:lang="en"/></SOAP-ENV:Reason>
+  </SOAP-ENV:Fault></SOAP-ENV:Body>
+</SOAP-ENV:Envelope>`
+	got := enrichSOAPErr(fakeResponse(body), errors.New("Post with digest error: 400: 400 Bad Request"))
+	require.Error(t, got)
+	assert.Contains(t, got.Error(), "ter:InvalidArgs",
+		"AXIS-style empty-Reason Faults must surface their Subcode")
+}
+
+func TestEnrichSOAPErr_NonFaultBodyIncludesExcerpt(t *testing.T) {
+	body := `<html><body>404 Not Found — /onvif/services missing</body></html>`
+	got := enrichSOAPErr(fakeResponse(body), errors.New("404 Not Found"))
+	require.Error(t, got)
+	assert.Contains(t, got.Error(), "/onvif/services missing")
+}
+
+func TestEnrichSOAPErr_LargeNonFaultBodyTruncated(t *testing.T) {
+	// A misbehaving camera could stream a multi-megabyte body. The
+	// helper must cap the excerpt so a wedged camera does not flood
+	// logs.
+	body := strings.Repeat("X", 8192)
+	got := enrichSOAPErr(fakeResponse(body), errors.New("500"))
+	require.Error(t, got)
+	assert.Less(t, len(got.Error()), 2048,
+		"enriched error must stay log-line sized even on huge bodies")
+}
+
+func TestEnrichSOAPErr_PreservesOriginalForErrorsIs(t *testing.T) {
+	// Callers wrap pull/renew/recreate errors with errors.As in
+	// logStreamError; enrichment must keep the original wrappable.
+	orig := errors.New("sentinel")
+	got := enrichSOAPErr(fakeResponse(`<env:Fault><faultstring>x</faultstring></env:Fault>`), orig)
+	assert.ErrorIs(t, got, orig)
+}
+
+// --- Subcode extraction ----------------------------------------------
+
+func TestExtractSOAPSubcode_Present(t *testing.T) {
+	body := `<SOAP-ENV:Code>
+  <SOAP-ENV:Value>SOAP-ENV:Sender</SOAP-ENV:Value>
+  <SOAP-ENV:Subcode><SOAP-ENV:Value>ter:InvalidArgs</SOAP-ENV:Value></SOAP-ENV:Subcode>
+</SOAP-ENV:Code>`
+	assert.Equal(t, "ter:InvalidArgs", extractSOAPSubcode(body))
+}
+
+func TestExtractSOAPSubcode_Absent(t *testing.T) {
+	assert.Empty(t, extractSOAPSubcode(`<env:Code><env:Value>env:Sender</env:Value></env:Code>`))
+}
+
+// --- Wiring: each SOAP call site routes errors through enrichSOAPErr -
+
+const faultBody = `<env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope">
+  <env:Body><env:Fault>
+    <env:Code><env:Value>env:Sender</env:Value></env:Code>
+    <env:Reason><env:Text xml:lang="en">camera-specific complaint</env:Text></env:Reason>
+  </env:Fault></env:Body>
+</env:Envelope>`
+
+func TestCreatePullPoint_EnrichesTransportErrWithFaultReason(t *testing.T) {
+	fc := newFakeCaller()
+	fc.queueCallMethod(faultBody, errors.New("400 Bad Request"))
+	_, err := createPullPoint(fc, defaultOptions())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "camera-specific complaint",
+		"createPullPoint must enrich transport errors with the camera's SOAP fault")
+}
+
+func TestPullMessages_EnrichesTransportErrWithFaultReason(t *testing.T) {
+	fc := newFakeCaller()
+	fc.queueSendSoap(faultBody, errors.New("400 Bad Request"))
+	_, err := pullMessages(fc, "http://camera/sub", defaultOptions())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "camera-specific complaint",
+		"pullMessages must enrich transport errors with the camera's SOAP fault")
+}
+
+func TestUnsubscribePullPoint_EnrichesTransportErrWithFaultReason(t *testing.T) {
+	fc := newFakeCaller()
+	fc.queueSendSoap(faultBody, errors.New("400 Bad Request"))
+	err := unsubscribePullPoint(fc, "http://camera/sub")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "camera-specific complaint",
+		"unsubscribePullPoint must enrich transport errors with the camera's SOAP fault")
 }
